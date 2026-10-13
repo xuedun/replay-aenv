@@ -363,6 +363,15 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--repeats", type=positive_int, default=DEFAULT_REPEATS)
     parser.add_argument(
+        "--timeout-sec",
+        type=nonnegative_int,
+        default=300,
+        help=(
+            "Timeout for setup and instance initialization commands "
+            "(default: 300; 0 disables)"
+        ),
+    )
+    parser.add_argument(
         "--lifecycle-timeout-sec",
         "--request-timeout-sec",
         dest="lifecycle_timeout_sec",
@@ -786,6 +795,8 @@ def command_for_trial(
         args.workdir,
         "--lifecycle-timeout-sec",
         str(args.lifecycle_timeout_sec),
+        "--timeout-sec",
+        str(args.timeout_sec),
         "--command-timeout-sec",
         str(args.command_timeout_sec),
         "--command-transport",
