@@ -6,6 +6,7 @@ import hashlib
 import json
 import logging
 import os
+import signal
 import re
 import shlex
 import sys
@@ -1288,8 +1289,8 @@ class ReplayRunner:
                     str(exc),
                 )
                 # WaitReady failure means the VM crashed during dual-backend
-                # resume. Do NOT retry — stop immediately so the server logs
-                # can be inspected for the root cause.
+                # resume. Do NOT retry — send SIGINT to self to stop the
+                # entire process immediately (triggers cleanup_all_sandboxes).
                 if wait_ready_failure:
                     self._log_retry_exhausted(
                         stage="resume",
@@ -1297,6 +1298,7 @@ class ReplayRunner:
                         retryable=False,
                         error=exc,
                     )
+                    os.kill(os.getpid(), signal.SIGINT)
                     break
                 # Resume rollback preserves the paused snapshot. Retry the same
                 # sandbox through the scheduler while retaining its RUNNING lease;
