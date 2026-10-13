@@ -150,6 +150,44 @@ def configure_aenv_environment(api_url: str) -> None:
     os.environ.setdefault("E2B_ACCESS_TOKEN", "dummy")
 
 
+async def cleanup_all_sandboxes(
+    *, label: str = "cleanup", log: logging.Logger | None = None
+) -> int:
+    """List and kill every sandbox on the configured AgentENV server."""
+    logger = log or LOGGER
+    from e2b import AsyncSandbox
+    from e2b.sandbox.sandbox_api import SandboxQuery
+
+    killed = 0
+    try:
+        paginator = AsyncSandbox.list(query=SandboxQuery(), limit=200)
+        all_sandboxes: list[Any] = []
+        while paginator.has_next:
+            all_sandboxes.extend(await paginator.next_items())
+    except Exception as exc:
+        logger.warning("[%s] Failed to list sandboxes: %s: %r", label, type(exc).__name__, exc)
+        return 0
+
+    if not all_sandboxes:
+        logger.info("[%s] No sandboxes to clean up", label)
+        return 0
+
+    logger.info("[%s] Killing %d sandbox(es)", label, len(all_sandboxes))
+    for sandbox in all_sandboxes:
+        sid = getattr(sandbox, "sandbox_id", str(sandbox))
+        try:
+            await AsyncSandbox.kill(sid)
+            killed += 1
+            logger.info("[%s] Killed sandbox %s", label, sid)
+        except Exception as exc:
+            logger.warning(
+                "[%s] Failed to kill sandbox %s: %s: %r",
+                label, sid, type(exc).__name__, exc,
+            )
+    logger.info("[%s] Cleaned up %d/%d sandbox(es)", label, killed, len(all_sandboxes))
+    return killed
+
+
 def load_trajectory(path: str | Path) -> tuple[str, str, list[ReplayStep]]:
     trajectory_path = Path(path).expanduser().resolve()
     if not trajectory_path.is_file():
@@ -2653,7 +2691,11 @@ def main() -> int:
     try:
         return asyncio.run(args.handler(args))
     except KeyboardInterrupt:
-        LOGGER.warning("Interrupted")
+        LOGGER.warning("Interrupted — cleaning up all sandboxes")
+        try:
+            asyncio.run(cleanup_all_sandboxes(label="interrupt"))
+        except Exception as exc:
+            LOGGER.error("Cleanup failed: %s: %s", type(exc).__name__, exc)
         return 130
     except Exception as exc:
         LOGGER.error("%s: %s", type(exc).__name__, exc)

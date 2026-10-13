@@ -1403,12 +1403,18 @@ def run_trial(
                     log_handle.flush()
                 return_code = process.wait()
             except KeyboardInterrupt:
-                process.terminate()
+                print("\n[interrupted] terminating subprocess; cleaning up sandboxes",
+                      file=sys.stderr, flush=True)
+                process.send_signal(signal.SIGINT)
                 try:
-                    process.wait(timeout=15)
+                    process.wait(timeout=30)
                 except subprocess.TimeoutExpired:
                     process.kill()
                     process.wait()
+                try:
+                    cleanup_all_sandboxes(args)
+                except Exception as exc:
+                    print(f"[cleanup] error: {exc}", file=sys.stderr, flush=True)
                 raise
     finally:
         monitor_status = stop_observability(monitor)
