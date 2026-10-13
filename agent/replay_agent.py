@@ -1197,16 +1197,43 @@ class ReplayRunner:
         if self.sandbox is None:
             raise RuntimeError("Sandbox is not available")
         started_at = absolute_timestamp()
-        slot_started = time.perf_counter()
-        async with self.control_plane_scheduler.pause_slot():
-            scheduler_wait_sec = time.perf_counter() - slot_started
-            api_started = time.perf_counter()
+        scheduler_wait_sec = 0.0
+        api_sec = 0.0
+        last_error: Exception | None = None
+        self._paused = False
+        for attempt in range(1, self.options.lifecycle_retries + 2):
+            slot_started = time.perf_counter()
             try:
-                await self.sandbox.beta_pause(
-                    request_timeout=self.options.lifecycle_timeout_sec,
+                async with self.control_plane_scheduler.pause_slot():
+                    scheduler_wait_sec += time.perf_counter() - slot_started
+                    api_started = time.perf_counter()
+                    try:
+                        await self.sandbox.beta_pause(
+                            request_timeout=self.options.lifecycle_timeout_sec,
+                        )
+                    finally:
+                        api_sec = time.perf_counter() - api_started
+                last_error = None
+                break
+            except Exception as exc:
+                last_error = exc
+                retryable = is_transient_sandbox_error(exc)
+                if not retryable or attempt > self.options.lifecycle_retries:
+                    self._log_retry_exhausted(
+                        stage="pause",
+                        attempts=attempt,
+                        retryable=retryable,
+                        error=exc,
+                    )
+                    break
+                self._log_retry_queued(
+                    stage="pause",
+                    attempt=attempt,
+                    max_attempts=self.options.lifecycle_retries + 1,
+                    error=exc,
                 )
-            finally:
-                api_sec = time.perf_counter() - api_started
+        if last_error is not None:
+            raise last_error
         self._paused = True
         completed_at = absolute_timestamp()
         completed_monotonic = time.monotonic()
@@ -1214,7 +1241,6 @@ class ReplayRunner:
             "pause_started_at": started_at,
             "pause_completed_at": completed_at,
             "pause_completed_monotonic": completed_monotonic,
-            # Report API latency only; keep local rate-limit wait separate.
             "pause_sec": api_sec,
             "pause_scheduler_wait_sec": scheduler_wait_sec,
             "pause_api_sec": api_sec,
