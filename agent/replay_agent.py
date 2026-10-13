@@ -1287,13 +1287,21 @@ class ReplayRunner:
                     r"\b500: sandbox ([0-9a-fA-F-]{36}) operation WaitReady failed:",
                     str(exc),
                 )
+                # WaitReady failure means the VM crashed during dual-backend
+                # resume. Do NOT retry — stop immediately so the server logs
+                # can be inspected for the root cause.
+                if wait_ready_failure:
+                    self._log_retry_exhausted(
+                        stage="resume",
+                        attempts=attempt,
+                        retryable=False,
+                        error=exc,
+                    )
+                    break
                 # Resume rollback preserves the paused snapshot. Retry the same
                 # sandbox through the scheduler while retaining its RUNNING lease;
                 # deleting and recreating here would lose prior trajectory state.
-                retryable = is_transient_sandbox_error(exc) or bool(
-                    wait_ready_failure
-                    and wait_ready_failure.group(1).lower() == str(self.sandbox_id).lower()
-                )
+                retryable = is_transient_sandbox_error(exc)
                 if not retryable:
                     self._log_retry_exhausted(
                         stage="resume",
