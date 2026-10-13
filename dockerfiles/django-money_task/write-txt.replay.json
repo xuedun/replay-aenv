@@ -1,0 +1,17 @@
+{
+  "environment": "main",
+  "instance_id": "snapshot-payload-write-txt",
+  "trajectory": [
+    {
+      "action": "writeTxt 100",
+      "response": "",
+      "thought": "",
+      "delay_time": 0.0
+    }
+  ],
+  "history": [],
+  "info": {
+    "instance_id": "snapshot-payload-write-txt",
+    "purpose": "Write 100 exact 1 MiB files before the post-action pause"
+  }
+}

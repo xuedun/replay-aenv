@@ -1,0 +1,244 @@
+FROM ubuntu:22.04
+
+ARG DEBIAN_FRONTEND=noninteractive
+ARG PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple
+ARG PIP_DEFAULT_TIMEOUT=300
+
+USER root
+
+# 基础系统依赖：
+# - SWE-agent tools 常用 shell 命令
+# - Python 工具运行环境
+# - 编译部分 Python 扩展所需工具链
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        bash \
+        build-essential \
+        ca-certificates \
+        coreutils \
+        curl \
+        findutils \
+        gawk \
+        git \
+        grep \
+        jq \
+        less \
+        patch \
+        pkg-config \
+        python3 \
+        python3-dev \
+        python3-pip \
+        python3-setuptools \
+        python3-venv \
+        python3-wheel \
+        ripgrep \
+        sed \
+        tmux \
+    && rm -rf /var/lib/apt/lists/*
+
+# 后续使用 source、[[ ]]、进程替换等 Bash 语法。
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+
+RUN mkdir -p \
+    /testbed \
+    /opt/sweagent/tools
+
+# build context 中需要存在：
+#
+#   sweagent-tools/
+#     registry/
+#     edit_anthropic/
+#     search/
+#     ...
+#
+# 这里原样复制 SWE-agent/tools 内容。
+COPY sweagent-tools/ /opt/sweagent/tools/
+
+# 工具脚本赋予执行权限。
+RUN set -eux; \
+    find /opt/sweagent/tools \
+        -type f \
+        -path '*/bin/*' \
+        -exec chmod +x {} +; \
+    find /opt/sweagent/tools \
+        -type f \
+        -name 'install.sh' \
+        -exec chmod +x {} +
+
+# 不遍历执行所有 install.sh。
+#
+# 原因：
+# 部分 install.sh 不是独立安装脚本，而是依赖 SWE-agent ToolHandler
+# 注入的 _write_env / _read_env 等 shell 函数。
+#
+# 例如 search/install.sh：
+#
+#   _write_env SEARCH_RESULTS "()"
+#   _write_env SEARCH_FILES "()"
+#   _write_env SEARCH_INDEX 0
+#
+# 在独立 Docker build 中直接运行会出现：
+#
+#   _write_env: command not found
+#
+# 当前基础镜像只安装工具真实的运行时依赖。
+RUN python3 -m pip install --no-cache-dir \
+        flake8 \
+        tree-sitter==0.21.3 \
+        tree-sitter-languages==1.10.2
+
+# 收集所有工具的 bin 目录，运行时加入 PATH。
+RUN set -eux; \
+    find /opt/sweagent/tools \
+        -type d \
+        -name bin \
+        | sort -u \
+        | paste -sd ':' - \
+        > /opt/sweagent/tools-path; \
+    test -s /opt/sweagent/tools-path; \
+    echo "SWE-agent tool PATH entries:"; \
+    tr ':' '\n' < /opt/sweagent/tools-path
+
+# 收集 Python 模块目录，运行时加入 PYTHONPATH。
+#
+# 包含：
+# - 每个一级 bundle 根目录
+# - 所有 lib 目录
+# - 所有 bin 目录
+#
+# 这样 str_replace_editor 内部的：
+#
+#   from registry import registry as REGISTRY
+#
+# 才能正常导入。
+RUN set -eux; \
+    { \
+        find /opt/sweagent/tools \
+            -mindepth 1 \
+            -maxdepth 1 \
+            -type d; \
+        find /opt/sweagent/tools \
+            -type d \
+            \( -name lib -o -name bin \); \
+    } \
+        | sort -u \
+        | paste -sd ':' - \
+        > /opt/sweagent/python-path; \
+    test -s /opt/sweagent/python-path; \
+    echo "SWE-agent Python path entries:"; \
+    tr ':' '\n' < /opt/sweagent/python-path
+
+# 创建统一的工具环境激活脚本。
+RUN cat > /opt/sweagent/activate-tools.sh <<'EOF'
+#!/usr/bin/env bash
+
+set -e
+
+TOOLS_PATH_FILE=/opt/sweagent/tools-path
+PYTHON_PATH_FILE=/opt/sweagent/python-path
+
+if [[ ! -s "${TOOLS_PATH_FILE}" ]]; then
+    echo "Missing or empty SWE-agent tools path: ${TOOLS_PATH_FILE}" >&2
+    return 1 2>/dev/null || exit 1
+fi
+
+if [[ ! -s "${PYTHON_PATH_FILE}" ]]; then
+    echo "Missing or empty SWE-agent Python path: ${PYTHON_PATH_FILE}" >&2
+    return 1 2>/dev/null || exit 1
+fi
+
+SWE_TOOL_PATH="$(cat "${TOOLS_PATH_FILE}")"
+SWE_PYTHON_PATH="$(cat "${PYTHON_PATH_FILE}")"
+
+export PATH="${SWE_TOOL_PATH}:${PATH}"
+export PYTHONPATH="${SWE_PYTHON_PATH}${PYTHONPATH:+:${PYTHONPATH}}"
+
+export SWE_AGENT_TOOLS=/opt/sweagent/tools
+
+export PAGER=cat
+export MANPAGER=cat
+export GIT_PAGER=cat
+export LESS=-FRX
+export TERM="${TERM:-xterm-256color}"
+
+export PYTHONUNBUFFERED=1
+export PIP_PROGRESS_BAR=off
+export TQDM_DISABLE=1
+EOF
+
+RUN chmod +x /opt/sweagent/activate-tools.sh
+
+# Harbor Adapter 统一通过：
+#
+#   swe-tool-shell bash -lc '<trajectory action>'
+#
+# 来执行 action。
+RUN cat > /usr/local/bin/swe-tool-shell <<'EOF'
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+source /opt/sweagent/activate-tools.sh
+
+exec "$@"
+EOF
+
+RUN chmod +x /usr/local/bin/swe-tool-shell
+
+# 手工进入容器时也可 source 此文件。
+RUN ln -sf \
+    /opt/sweagent/activate-tools.sh \
+    /etc/profile.d/sweagent-tools.sh
+
+# 记录所有工具脚本，方便排查。
+RUN set -eux; \
+    find /opt/sweagent/tools \
+        -type f \
+        -path '*/bin/*' \
+        -print \
+        | sort \
+        > /opt/sweagent/tool-files.txt; \
+    test -s /opt/sweagent/tool-files.txt; \
+    echo "Installed SWE-agent tool files:"; \
+    cat /opt/sweagent/tool-files.txt
+
+# 构建阶段关键校验。
+#
+# 注意：
+# - 不执行 search/install.sh
+# - 不初始化 SEARCH_RESULTS 等状态
+# - 当前 replay 使用显式文件/目录参数时不依赖这些状态
+RUN set -eux; \
+    source /opt/sweagent/activate-tools.sh; \
+    command -v bash; \
+    command -v git; \
+    command -v python3; \
+    command -v str_replace_editor; \
+    python3 -c "import registry; print('registry import OK:', registry)"; \
+    type -a str_replace_editor
+
+# 验证 search bundle 的命令可见。
+# 某些 SWE-agent 版本的命令名称可能不同，因此逐个检测，不强制全部存在。
+RUN set -eux; \
+    source /opt/sweagent/activate-tools.sh; \
+    for cmd in search_file search_dir find_file; do \
+        if command -v "${cmd}" >/dev/null 2>&1; then \
+            echo "${cmd}: $(command -v "${cmd}")"; \
+        else \
+            echo "${cmd}: not present in this SWE-agent tools version"; \
+        fi; \
+    done
+
+ENV SWE_AGENT_TOOLS=/opt/sweagent/tools \
+    PAGER=cat \
+    MANPAGER=cat \
+    GIT_PAGER=cat \
+    LESS=-FRX \
+    TERM=xterm-256color \
+    PYTHONUNBUFFERED=1 \
+    PIP_PROGRESS_BAR=off \
+    TQDM_DISABLE=1
+
+WORKDIR /testbed
+
+CMD ["bash"]

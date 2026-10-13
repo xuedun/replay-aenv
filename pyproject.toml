@@ -1,0 +1,21 @@
+[project]
+name = "replay-aenv"
+version = "0.1.0"
+description = "Standalone trajectory replay agent for AgentENV"
+requires-python = ">=3.12"
+dependencies = [
+    "e2b>=2.25.0,<3",
+]
+
+[project.scripts]
+replay-aenv = "agent.replay_agent:main"
+replay-aenv-no-lifecycle = "agent.replay_agent_no_lifecycle:main"
+replay-aenv-snapshot = "agent.replay_agent_snapshot:main"
+replay-aenv-snapshot-same-sandbox = "agent.replay_agent_snapshot_same_sandbox:main"
+
+[build-system]
+requires = ["setuptools>=75"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["agent"]

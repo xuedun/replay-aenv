@@ -1,0 +1,22 @@
+{
+  "workloads": [
+    {
+      "name": "image-a",
+      "template": "image-a",
+      "trajectory_dir": "/data/traces/a",
+      "vm_count": 50
+    },
+    {
+      "name": "image-b",
+      "template": "image-b",
+      "trajectory_dir": "/data/traces/b",
+      "vm_count": 30
+    },
+    {
+      "name": "image-c",
+      "template": "image-c",
+      "trajectory_dir": "/data/traces/c",
+      "vm_count": 20
+    }
+  ]
+}
