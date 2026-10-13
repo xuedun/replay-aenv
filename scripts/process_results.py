@@ -37,26 +37,62 @@ def find_replay_results(results_dir: Path) -> list[Path]:
     return sorted(results_dir.rglob("replay-result.json"))
 
 
-def extract_step_timings(result_json: dict) -> list[dict]:
-    """Extract per-step timing from a replay-result.json."""
+def detect_scenario(result_json: dict) -> str:
+    """Detect whether a replay-result is pause-resume or no-lifecycle (COW)."""
     steps = result_json.get("steps", [])
+    if not steps:
+        return "unknown"
+    first = steps[0]
+    if "paused_sec" in first or "pause_sec" in first:
+        return "pause-resume"
+    if first.get("sandbox_lifecycle_enabled") is False:
+        return "cow"
+    if "pause_sec" in first or "resume_sec" in first:
+        return "pause-resume"
+    return "cow"
+
+
+def extract_step_timings(result_json: dict) -> tuple[list[dict], str]:
+    """Extract per-step timing from a replay-result.json.
+
+    Returns (rows, scenario) where scenario is 'pause-resume' or 'cow'.
+    """
+    steps = result_json.get("steps", [])
+    scenario = detect_scenario(result_json)
     rows = []
     for i, step in enumerate(steps, 1):
+        if scenario == "pause-resume":
+            wait_sec = step.get("paused_sec", 0.0)
+            pause_sec = step.get("pause_sec", 0.0)
+            resume_sec = step.get("resume_total_sec", step.get("resume_sec", 0.0))
+            post_pause_sec = step.get("post_command_pause_sec", 0.0)
+            capacity_wait = step.get("capacity_wait_sec", 0.0)
+            run_queue_wait = step.get("run_queue_wait_sec", 0.0)
+        else:
+            # COW: no pause/resume, "wait" is the delay between actions
+            wait_sec = step.get("delay_wait_sec", 0.0)
+            pause_sec = 0.0
+            resume_sec = 0.0
+            post_pause_sec = 0.0
+            capacity_wait = 0.0
+            run_queue_wait = 0.0
+
         rows.append({
             "action": i,
-            "wait_sec": round(step.get("paused_sec", 0.0), 4),
-            "exec_sec": round(step.get("command_sec", 0.0), 4),
-            "pause_sec": round(step.get("pause_sec", 0.0), 4),
-            "resume_sec": round(step.get("resume_total_sec", step.get("resume_sec", 0.0)), 4),
+            "scenario": scenario,
+            "wait_sec": round(wait_sec, 4),
+            "exec_sec": round(step.get("command_sec", step.get("elapsed_sec", 0.0)), 4),
+            "pause_sec": round(pause_sec, 4),
+            "resume_sec": round(resume_sec, 4),
             "delay_wait_sec": round(step.get("delay_wait_sec", 0.0), 4),
-            "capacity_wait_sec": round(step.get("capacity_wait_sec", 0.0), 4),
-            "run_queue_wait_sec": round(step.get("run_queue_wait_sec", 0.0), 4),
+            "capacity_wait_sec": round(capacity_wait, 4),
+            "run_queue_wait_sec": round(run_queue_wait, 4),
             "interaction_total_sec": round(step.get("interaction_total_sec", 0.0), 4),
-            "post_pause_sec": round(step.get("post_command_pause_sec", 0.0), 4),
+            "post_pause_sec": round(post_pause_sec, 4),
             "succeeded": step.get("succeeded", False),
             "exit_code": step.get("exit_code", ""),
         })
-    return rows
+    return rows, scenario
 
 
 def process_vm_timings(results_dir: Path, output_dir: Path):
@@ -72,7 +108,7 @@ def process_vm_timings(results_dir: Path, output_dir: Path):
     print(f"[vm_timings] Found {len(result_files)} replay results")
 
     timing_fields = [
-        "action", "wait_sec", "exec_sec", "pause_sec", "resume_sec",
+        "action", "scenario", "wait_sec", "exec_sec", "pause_sec", "resume_sec",
         "delay_wait_sec", "capacity_wait_sec", "run_queue_wait_sec",
         "interaction_total_sec", "post_pause_sec", "succeeded", "exit_code",
     ]
@@ -85,7 +121,7 @@ def process_vm_timings(results_dir: Path, output_dir: Path):
             print(f"  [WARN] Cannot parse {result_path}: {e}")
             continue
 
-        steps = extract_step_timings(result)
+        steps, scenario = extract_step_timings(result)
         if not steps:
             continue
 
@@ -114,6 +150,7 @@ def process_vm_timings(results_dir: Path, output_dir: Path):
         summary_rows.append({
             "vm": vm_name,
             "label": vm_label,
+            "scenario": scenario,
             "sandbox_id": sandbox_id,
             "actions": n,
             "avg_wait_sec": round(avg_wait, 4),
@@ -130,7 +167,7 @@ def process_vm_timings(results_dir: Path, output_dir: Path):
 
     summary_path = output_dir / "vm_summary.csv"
     summary_fields = [
-        "vm", "label", "sandbox_id", "actions",
+        "vm", "label", "scenario", "sandbox_id", "actions",
         "avg_wait_sec", "avg_exec_sec", "avg_pause_sec", "avg_resume_sec",
         "avg_interaction_sec",
         "total_wait_sec", "total_exec_sec", "total_pause_sec", "total_resume_sec",
