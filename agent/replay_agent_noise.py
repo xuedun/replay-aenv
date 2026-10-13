@@ -2340,6 +2340,15 @@ async def run_batch(args: argparse.Namespace) -> int:
                 result = await run_one(worker_idx, scheduled, real_dir, rollout_idx)
                 items_by_index[worker_idx] = result
             except Exception as exc:
+                if "WaitReady failed" in str(exc):
+                    items_by_index[worker_idx] = {
+                        "index": worker_idx,
+                        "rollout": rollout_idx,
+                        "succeeded": False,
+                        "error": f"{type(exc).__name__}: {exc}",
+                    }
+                    stop_event.set()
+                    return
                 items_by_index[worker_idx] = {
                     "index": worker_idx,
                     "rollout": rollout_idx,

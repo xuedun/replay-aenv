@@ -2326,14 +2326,29 @@ async def run_batch(args: argparse.Namespace) -> int:
         None
     ] * len(scheduled_trajectories)
 
+    fatal_error: Exception | None = None
+    fatal_event = asyncio.Event()
+
     async def worker() -> None:
+        nonlocal fatal_error
         while True:
+            if fatal_event.is_set():
+                return
             work_item = await work_queue.get()
             try:
                 if work_item is None:
                     return
+                if fatal_event.is_set():
+                    return
                 index, scheduled = work_item
-                items_by_index[index - 1] = await run_one(index, scheduled)
+                try:
+                    items_by_index[index - 1] = await run_one(index, scheduled)
+                except Exception as exc:
+                    if "WaitReady failed" in str(exc):
+                        fatal_error = exc
+                        fatal_event.set()
+                        return
+                    raise
             finally:
                 work_queue.task_done()
 
@@ -2342,9 +2357,15 @@ async def run_batch(args: argparse.Namespace) -> int:
     await work_queue.join()
     for _ in workers:
         work_queue.put_nowait(None)
-    await asyncio.gather(*workers)
+    await asyncio.gather(*workers, return_exceptions=True)
     running_snapshot = running_slot_scheduler.snapshot()
     await running_slot_scheduler.close()
+
+    if fatal_error is not None:
+        raise fatal_error
+    for w in workers:
+        if isinstance(w.exception() if not w.cancelled() else None, Exception):
+            pass
 
     if any(item is None for item in items_by_index):
         raise RuntimeError("Batch worker finished without producing every result")
