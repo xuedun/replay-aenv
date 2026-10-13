@@ -782,7 +782,7 @@ def command_for_trial(
         "--concurrency",
         str(target_count),
         "--running-concurrency",
-        str(args.running_concurrency),
+        str(target_count),
         "--control-plane-qps",
         str(args.control_plane_qps),
         "--control-plane-max-inflight",
