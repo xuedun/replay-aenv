@@ -310,11 +310,11 @@ def read_cgroup_mem(mem_path, version="v1"):
         except (OSError, ValueError):
             pass
         stat_keys = {
-            "rss": "rss_bytes",
-            "cache": "cache_bytes",
-            "shmem": "shmem_bytes",
-            "dirty": "dirty_bytes",
-            "writeback": "writeback_bytes",
+            "total_rss": "rss_bytes",
+            "total_cache": "cache_bytes",
+            "total_swap": "shmem_bytes",
+            "total_dirty": "dirty_bytes",
+            "total_writeback": "writeback_bytes",
         }
         try:
             with open(f"{mem_path}/memory.stat") as f:
