@@ -567,7 +567,7 @@ class ReplayRunner:
         *,
         stage: str,
         attempt: int,
-        max_attempts: int,
+        max_attempts: int | str,
         error: BaseException,
     ) -> None:
         """Record a transient failure that will re-enter the global QPS queue."""
@@ -1201,7 +1201,9 @@ class ReplayRunner:
         api_sec = 0.0
         last_error: Exception | None = None
         self._paused = False
-        for attempt in range(1, self.options.lifecycle_retries + 2):
+        attempt = 0
+        while True:
+            attempt += 1
             slot_started = time.perf_counter()
             try:
                 async with self.control_plane_scheduler.pause_slot():
@@ -1218,7 +1220,7 @@ class ReplayRunner:
             except Exception as exc:
                 last_error = exc
                 retryable = is_transient_sandbox_error(exc)
-                if not retryable or attempt > self.options.lifecycle_retries:
+                if not retryable:
                     self._log_retry_exhausted(
                         stage="pause",
                         attempts=attempt,
@@ -1229,9 +1231,10 @@ class ReplayRunner:
                 self._log_retry_queued(
                     stage="pause",
                     attempt=attempt,
-                    max_attempts=self.options.lifecycle_retries + 1,
+                    max_attempts="∞",
                     error=exc,
                 )
+                await asyncio.sleep(min(2 ** min(attempt, 6), 60))
         if last_error is not None:
             raise last_error
         self._paused = True
@@ -1260,7 +1263,9 @@ class ReplayRunner:
         # A timeout is ambiguous: the backend may already be RUNNING. Keep the
         # lease reserved until pause or delete is confirmed.
         self._paused = False
-        for attempt in range(1, self.options.lifecycle_retries + 2):
+        attempt = 0
+        while True:
+            attempt += 1
             attempts = attempt
             slot_started = time.perf_counter()
             try:
@@ -1289,7 +1294,7 @@ class ReplayRunner:
                     wait_ready_failure
                     and wait_ready_failure.group(1).lower() == str(self.sandbox_id).lower()
                 )
-                if not retryable or attempt > self.options.lifecycle_retries:
+                if not retryable:
                     self._log_retry_exhausted(
                         stage="resume",
                         attempts=attempt,
@@ -1300,9 +1305,10 @@ class ReplayRunner:
                 self._log_retry_queued(
                     stage="resume",
                     attempt=attempt,
-                    max_attempts=self.options.lifecycle_retries + 1,
+                    max_attempts="∞",
                     error=exc,
                 )
+                await asyncio.sleep(min(2 ** min(attempt, 6), 60))
         if last_error is not None:
             raise RuntimeError(
                 "Sandbox lifecycle reconnect failed after "
