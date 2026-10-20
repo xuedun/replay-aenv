@@ -39,7 +39,7 @@ DEFAULT_REPO_DIR = Path(__file__).parent.parent
 DEFAULT_TRAJECTORY_DIR = DEFAULT_REPO_DIR / "delay_time_trajectories"
 DEFAULT_RATIOS = "1,2,3,4,5,6,7,8,9,10,11,12"
 DEFAULT_REPEATS = 2
-DEFAULT_API_URL = "http://127.0.0.1:8000"
+DEFAULT_API_URL = "http://127.0.0.1:8002"
 DEFAULT_API_KEY_FILE = Path("/var/lib/aenv/secrets/api-key")
 DEFAULT_COMMAND_TRANSPORT = "aenv-proxy"
 DEFAULT_ENVD_PORT = 49_983
@@ -809,6 +809,7 @@ def command_for_trial(
     ]
     if args.stop_on_error:
         command.append("--stop-on-error")
+    command.append("--keep-sandbox-on-failure")
     if args.command_timeout_continue:
         command.append("--command-timeout-continue")
     if args.delay is not None:
@@ -920,6 +921,7 @@ def start_observability(
         if getattr(args, "cgroup_version", "auto") != "auto":
             command.append(args.cgroup_version)
     if getattr(args, "cpu_range", None):
+        # Ensure cgroup_name placeholder is passed before cpu_range
         if not getattr(args, "cgroup_name", None):
             command.append("")  # empty cgroup_name placeholder
         command.append(getattr(args, "cgroup_version", "auto"))

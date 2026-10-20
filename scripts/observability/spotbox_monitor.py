@@ -446,7 +446,7 @@ def read_cgroup_mem(mem_path, version="v1"):
         stat_keys = {
             "total_rss": "rss_bytes",
             "total_cache": "cache_bytes",
-            "total_swap": "shmem_bytes",
+            "total_shmem": "shmem_bytes",
             "total_dirty": "dirty_bytes",
             "total_writeback": "writeback_bytes",
         }

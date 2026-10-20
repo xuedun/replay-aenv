@@ -1861,12 +1861,16 @@ class ReplayRunner:
             should_keep = (
                 self.options.keep_sandbox_on_failure
                 and (result is None or not result.get("succeeded", False))
-                and self._paused
             )
             if should_keep:
-                self._event(
-                    "warning", f"Keeping failed sandbox {self.sandbox_id} for debugging"
-                )
+                if self.sandbox is not None:
+                    self._event(
+                        "warning", f"Keeping failed sandbox {self.sandbox_id} for debugging (paused={self._paused})"
+                    )
+                else:
+                    self._event(
+                        "warning", f"Failed sandbox already gone (sandbox_id={self.sandbox_id})"
+                    )
             else:
                 cleanup_succeeded = False
                 try:

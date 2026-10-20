@@ -409,6 +409,45 @@ python3 scripts/run_pause_resume_oversubscription_benchmark.py \
   --output-root ./runs/dual-pr-noise-$(date +%Y%m%d-%H%M%S)
 ```
 
+export AENV_CONFIG_PATH=/home/cxd/AgentENV/config/default.toml
+export AENV_HOME_PATH=/var/lib/aenv
+export AENV_RUN_USER=cxd
+export CGROUP_NAME=aenv
+export RUST_LOG=info
+export AENV_API_KEY=$(cat $AENV_HOME_PATH/secrets/api-key)
+export API=http://localhost:8002
+unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY
+export no_proxy="localhost,127.0.0.1,169.254.0.0/16"
+
+./target/release/server --setup-only
+./target/release/server --setup-host --runtime-user $AENV_RUN_USER --runtime-group $AENV_RUN_USER
+
+for ctrl in cpu,cpuacct memory cpuset; do
+    mkdir -p /sys/fs/cgroup/$ctrl/$CGROUP_NAME.slice
+done
+
+# CPU 绑核 (如 192-319, 必须先设置 cpuset 再启动进程)
+echo "0-89" > /sys/fs/cgroup/cpuset/$CGROUP_NAME.slice/cpuset.cpus
+echo "0"    > /sys/fs/cgroup/cpuset/$CGROUP_NAME.slice/cpuset.mems
+# 内存限制 (如 512 GB)
+echo $((3 * 512 * 1024 * 1024 * 1024 )) > /sys/fs/cgroup/memory/$CGROUP_NAME.slice/memory.limit_in_bytes
+
+sudo -E systemd-run --slice=$CGROUP_NAME --scope \
+--setenv=AENV_RUN_USER=$AENV_RUN_USER --setenv=API_ADDR=0.0.0.0:8002 --setenv=RUST_LOG=info \
+scripts/run-with-capabilities.sh ./target/release/server > /tmp/srv.log 2>&1
+
+N_RUNNING=1 .venv/bin/python scripts/run_no_lifecycle_oversubscription_benchmark.py   \
+  --trajectory-dir /home/cxd/data/replay    \
+  --image-map /home/cxd/data/trajectory-templates.json    \
+  --workdir / --ratios 32  --launch-interval-sec 0.2  --timeout-sec 1200   --rollout 1 --repeats 1   \
+  --cgroup-name aenv.slice --cpu-range 0-95   --command-timeout-sec 1200   --command-timeout-continue
+
+N_RUNNING=1 .venv/bin/python scripts/run_pause_resume_oversubscription_benchmark.py   \
+  --trajectory-dir /home/cxd/data/replay    \
+  --image-map /home/cxd/data/trajectory-templates.json   \
+  --workdir / --ratios 80  --launch-interval-sec 0.2  --timeout-sec 1200   --rollout 1 --repeats 1   \
+  --cgroup-name aenv.slice --cpu-range 0-79   --command-timeout-sec 1200   --command-timeout-continue --delay 0.2 
+
 ### 10.4 三组对比实验
 
 ```bash
