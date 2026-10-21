@@ -538,6 +538,12 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Prepare the natural-order selection and print all commands only",
     )
+    parser.add_argument(
+        "--debug-breakpoint",
+        action="store_true",
+        default=False,
+        help="Break on errors only (pause/resume failure, WaitReady failure, command timeout or infrastructure error); passed to replay_agent",
+    )
     return parser
 
 
@@ -810,6 +816,8 @@ def command_for_trial(
     if args.stop_on_error:
         command.append("--stop-on-error")
     command.append("--keep-sandbox-on-failure")
+    if getattr(args, "debug_breakpoint", False):
+        command.append("--debug-breakpoint")
     if args.command_timeout_continue:
         command.append("--command-timeout-continue")
     if args.delay is not None:

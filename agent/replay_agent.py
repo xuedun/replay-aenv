@@ -126,6 +126,7 @@ class ReplayOptions:
     ready_probe_attempts: int = 5
     ready_probe_timeout_sec: int = 10
     keep_sandbox_on_failure: bool = False
+    debug_breakpoint: bool = False
     instance_overlay_dir: Path | None = None
     command_transport: str = "aenv-proxy"
     direct_envd_port: int = 49_983
@@ -1192,6 +1193,33 @@ class ReplayRunner:
             "elapsed_sec": elapsed_sec,
         }
 
+    async def _wait_breakpoint(self, bp_file: Path) -> None:
+        """Block until the operator continues: Enter when stdin is a tty,
+        otherwise until bp_file is removed."""
+        if sys.stdin is not None and sys.stdin.isatty():
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(
+                None, input, "[breakpoint] press Enter to continue..."
+            )
+        else:
+            while bp_file.exists():
+                await asyncio.sleep(1)
+        bp_file.unlink(missing_ok=True)
+
+    async def _error_breakpoint(self, context: str) -> None:
+        """Hold the replay for inspection when an error occurs
+        (only with --debug-breakpoint)."""
+        if not self.options.debug_breakpoint:
+            return
+        bp_file = Path(f"/tmp/replay_error_{self.sandbox_id}.ready")
+        bp_file.touch()
+        self._event(
+            "error",
+            f"DEBUG_BREAKPOINT_ERROR: {context} — sandbox {self.sandbox_id} "
+            f"held for inspection, press Enter or remove {bp_file} to continue...",
+        )
+        await self._wait_breakpoint(bp_file)
+
     async def _pause_sandbox_strict(self, *, reason: str) -> dict[str, Any]:
         """Pause and keep the running lease held unless the API succeeds."""
 
@@ -1237,10 +1265,12 @@ class ReplayRunner:
                 )
                 await asyncio.sleep(min(2 ** min(attempt, 6), 60))
         if last_error is not None:
+            await self._error_breakpoint(f"pause failed: {last_error!r}")
             raise last_error
         self._paused = True
         completed_at = absolute_timestamp()
         completed_monotonic = time.monotonic()
+
         return {
             "pause_started_at": started_at,
             "pause_completed_at": completed_at,
@@ -1298,6 +1328,10 @@ class ReplayRunner:
                         retryable=False,
                         error=exc,
                     )
+                    await self._error_breakpoint(
+                        f"resume WaitReady failed (guest may have crashed "
+                        f"during dual-backend resume): {exc!r}"
+                    )
                     os.kill(os.getpid(), signal.SIGINT)
                     break
                 # Resume rollback preserves the paused snapshot. Retry the same
@@ -1320,6 +1354,9 @@ class ReplayRunner:
                 )
                 await asyncio.sleep(min(2 ** min(attempt, 6), 60))
         if last_error is not None:
+            await self._error_breakpoint(
+                f"resume failed after {attempts} attempt(s): {last_error!r}"
+            )
             raise RuntimeError(
                 "Sandbox lifecycle reconnect failed after "
                 f"{attempts} attempt(s): {last_error!r}"
@@ -1603,6 +1640,14 @@ class ReplayRunner:
             self._job_event(
                 "warning",
                 f"[{step.index + 1}/{job_total_steps}] COMMAND TIMEOUT {outcome}",
+            )
+
+        if timed_out or infrastructure_error:
+            await self._error_breakpoint(
+                f"command {step.index + 1}/{job_total_steps} "
+                f"({step.action.splitlines()[0] if step.action else ''!r}) "
+                f"failed abnormally: timed_out={timed_out} "
+                f"infrastructure_error={infrastructure_error}"
             )
 
         completed_at = absolute_timestamp()
@@ -1929,6 +1974,7 @@ def replay_options_from_args(args: argparse.Namespace) -> ReplayOptions:
         ready_probe_attempts=args.ready_probe_attempts,
         ready_probe_timeout_sec=args.ready_probe_timeout_sec,
         keep_sandbox_on_failure=args.keep_sandbox_on_failure,
+        debug_breakpoint=getattr(args, "debug_breakpoint", False),
         instance_overlay_dir=(
             None
             if args.skip_instance_patch
@@ -2630,6 +2676,15 @@ def add_replay_arguments(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument("--stop-on-error", action="store_true")
     parser.add_argument("--keep-sandbox-on-failure", action="store_true")
+    parser.add_argument(
+        "--debug-breakpoint",
+        action="store_true",
+        help=(
+            "Breakpoint on errors only (press Enter to continue): pause/resume "
+            "failure, resume WaitReady failure (guest crash), command timeout "
+            "or infrastructure error. Normal command exit codes do not break."
+        ),
+    )
     parser.add_argument(
         "--instance-overlay-dir",
         default=DEFAULT_INSTANCE_OVERLAY_DIR,
