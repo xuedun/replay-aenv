@@ -318,11 +318,35 @@ class ProxyReplayRunner(replay_agent.ReplayRunner):
             f"generation={payload.get('bindingGeneration')}",
             timestamp=completed_at,
         )
+        # Mirror the base `_run_slice` timing line so proxy steps carry the
+        # same "Agent interaction timing" breakdown in job.log (resume and
+        # capacity_wait are structurally zero: the sandbox never left paused).
+        interaction_total_sec = (
+            preceding_pause["pause_sec"]
+            + requested_delay_sec
+            + elapsed_sec
+        )
+        proxy_ms = payload.get("durationMs")
+        timing_message = (
+            f"Agent interaction timing step={step.index + 1}/{job_total_steps} "
+            f"pause={preceding_pause['pause_sec']:.3f}s "
+            f"delay={requested_delay_sec:.3f}s "
+            f"capacity_wait=0.000s "
+            f"resume=0.000s "
+            f"command={elapsed_sec:.3f}s "
+            f"total={interaction_total_sec:.3f}s "
+            f"transport=proxy_read "
+            f"server_exec={proxy_ms}ms "
+            f"binding_generation={payload.get('bindingGeneration')}"
+        )
+        self._job_event("info", timing_message, timestamp=completed_at)
         self._block(
             "\n"
             f"[{completed_at}] [{step.index + 1}/{total_steps}] PROXY-READ END\n"
             f"exit_code: {exit_code}\n"
             f"elapsed: {elapsed_sec:.3f}s\n"
+            f"server_exec_ms: {proxy_ms}\n"
+            f"binding_generation: {payload.get('bindingGeneration')}\n"
             "stdout:\n"
             f"{stdout.rstrip() if stdout else '<empty>'}\n\n"
             "stderr:\n"
