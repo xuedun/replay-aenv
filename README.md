@@ -321,7 +321,7 @@ rm -f /run/aenv/ublk-daemon.sock
 
 ## 10. 过载基准测试
 
-两个基准测试驱动脚本位于 `scripts/` 目录，用于验证 AgentENV 在不同负载模式下的
+三个基准测试驱动脚本位于 `scripts/` 目录，用于验证 AgentENV 在不同负载模式下的
 性能、CPU 利用率和内存占用。
 
 ### 10.1 COW（无生命周期）场景
@@ -470,7 +470,84 @@ python3 scripts/run_pause_resume_oversubscription_benchmark.py \
   --output-root ./runs/groupC-dual-pause-resume
 ```
 
-### 10.5 参数说明
+### 10.5 Proxy-Read（代理沙箱读）场景
+
+Pause-Resume 场景的代理沙箱变体：**只读且不依赖环境变量的 action**（`ls` / `find` /
+`cat` / `grep` / `head` / `stat` / `diff` 等白名单命令）不再 resume 目标沙箱，而是通过
+AgentENV 常驻代理沙箱直接在 **paused 状态的 rootfs 上执行**：
+
+```
+POST /sandboxes/{id}/proxy-read   {"command": "...", "cwd": "/testbed"}
+```
+
+代理步骤**不占用 RUNNING 槽位、不 resume、不 pause**——目标沙箱全程保持 paused。
+其余 action（写操作、依赖环境变量、命令替换、重定向、非白名单命令）仍走原有的
+resume → command → pause 流程，因此负载语义与 Pause-Resume 基准完全一致、可直接对比。
+
+**前置条件**（AgentENV server 侧）：
+
+1. 配置 `[proxy] enabled = true`（只能改配置文件，无环境变量覆盖）
+2. `[proxy] image` 指向可达的镜像仓库（如 `localhost:5000/...`，裸名 `ubuntu:22.04`
+   会解析到 docker.io，内网直连不通时启动会卡在拉取）
+3. ublk daemon 二进制需包含 `AdoptSlotTarget` / `UnbindSlot` RPC（新版 AgentENV）
+
+server 未开启 `[proxy]` 时基准自动降级：代理步骤失败即回退 resume 路径
+（`transport=resume_fallback`），结果等同于基线 Pause-Resume。
+
+**涉及文件**：
+
+- `scripts/run_proxy_read_oversubscription_benchmark.py` — 驱动脚本，复用 Pause-Resume
+  基准实现，仅替换 agent、追加 proxy 指标列；CLI 与原版完全一致
+- `agent/replay_agent_proxy.py` — replay agent，仅覆写 `_run_slice` 做步骤分流
+
+**命令判定规则**（保守优先，误判写操作的代价是轨迹偏离，误判读操作只多付一次
+resume）：
+
+- 白名单命令按 `&&` / `||` / `|` / `;` / 换行分段后逐段校验首词
+- 排除：环境变量引用（`$`）、命令替换（反引号 / `$(`）、任何重定向（`>` `<`，
+  含 heredoc 与 `2>/dev/null`）、`find` 的突变原语（`-delete` / `-exec` 等）
+- 代理执行为 `chroot <目标rootfs> /bin/sh -c '<command>'`，使用目标镜像自带的
+  shell 与二进制（GNU 参数兼容）；chroot 内找不到命令（exit 127）自动回退
+
+```bash
+# 运行 proxy-read 基准测试（server 需开启 [proxy]）
+python3 scripts/run_proxy_read_oversubscription_benchmark.py \
+  --running-concurrency 8 \
+  --ratios 1,2,4,8 \
+  --repeats 2 \
+  --trajectory-dir ./delay_time_trajectories \
+  --image-map ./image-map.json \
+  --api-url http://127.0.0.1:8000 \
+  --command-transport aenv-proxy \
+  --cgroup-name aenv \
+  --cpu-range 0-159 \
+  --observability \
+  --observability-interval-sec 1.0 \
+  --output-root ./runs/proxy-read-$(date +%Y%m%d-%H%M%S)
+```
+
+**输出**：trial / task / step CSV 与 Pause-Resume 基准同构，额外增加：
+
+| 层级 | 新增列 | 含义 |
+|------|--------|------|
+| step | `transport` | `proxy_read` / `resume` / `resume_fallback` |
+| step | `proxy_eligible` / `proxy_skip_reason` | 分类结果与不可代理原因 |
+| step | `proxy_fallback_reason` | 回退原因（proxy 失败详情） |
+| step | `proxy_duration_ms` / `binding_generation` | server 侧执行耗时 / 绑定代号 |
+| task | `proxy_read_steps` / `resume_steps` / `resume_fallback_steps` | 各传输路径步数 |
+| task | `running_slot_saved_steps` | 省掉运行槽位的步数（= proxy_read_steps） |
+| task | `proxy_read_ratio` | 代理步占比 |
+| step | `running_slot_held_sec` | 代理步恒为 0（对比核心指标） |
+
+**专用参数**（其余参数与 10.6 参数说明一致）：
+
+| 参数 | 默认 | 说明 |
+|------|------|------|
+| `--proxy-read-disable` | 关 | 全部走 resume 路径，即基线模式（用于同机对比） |
+| `--proxy-read-no-fallback` | 关 | 代理失败时让轨迹失败而不是回退 resume |
+| `--proxy-read-retry-timeout-sec` | 30 | 503 `rebind_in_progress` 重试窗口（秒） |
+
+### 10.6 参数说明
 
 | 参数 | 默认 | 说明 |
 |------|------|------|
@@ -494,8 +571,11 @@ python3 scripts/run_pause_resume_oversubscription_benchmark.py \
 | `--observability` | 开 | 是否运行 spotbox_monitor |
 | `--observability-interval-sec` | 1.0 | 监控采样间隔秒 |
 | `--output-root` | 自动 | 输出目录 |
+| `--proxy-read-disable` | 关 | proxy-read 专用: 全部走 resume 路径（基线模式） |
+| `--proxy-read-no-fallback` | 关 | proxy-read 专用: 代理失败时不回退 resume |
+| `--proxy-read-retry-timeout-sec` | 30 | proxy-read 专用: 503 rebind 重试窗口秒数 |
 
-### 10.6 外部监控脚本
+### 10.7 外部监控脚本
 
 `scripts/observability/spotbox_monitor.py` 是独立的 1Hz 监控脚本, 采集:
 
