@@ -69,6 +69,10 @@ def install_patches(base: Any) -> None:
     """Redirect the base benchmark onto the proxy agent and extend outputs."""
     import json
 
+    # Auto-generated run dirs are named proxy-read-oversub-N* instead of
+    # pause-resume-oversub-N*.
+    base.RUN_NAME_PREFIX = "proxy-read-oversub"
+
     base.STEP_COLUMNS.extend(PROXY_STEP_COLUMNS)
     base.TASK_COLUMNS.extend(PROXY_TASK_COLUMNS)
 

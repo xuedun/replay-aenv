@@ -49,6 +49,11 @@ DEFAULT_OBSERVABILITY_INTERVAL_SEC = 1.0
 OBSERVABILITY_STARTUP_TIMEOUT_SEC = 30.0
 OBSERVABILITY_STOP_TIMEOUT_SEC = 30.0
 
+#: Prefix of the auto-generated run directory name. Variant drivers (e.g. the
+#: proxy-read benchmark) patch this so their runs are distinguishable at a
+#: glance instead of all landing under `pause-resume-oversub-*`.
+RUN_NAME_PREFIX = "pause-resume-oversub"
+
 
 def cleanup_all_sandboxes(args: argparse.Namespace) -> int:
     """Kill every sandbox on the AgentENV server via the aenv CLI."""
@@ -1624,7 +1629,7 @@ def main() -> int:
     output_root = (
         args.output_root.expanduser().resolve()
         if args.output_root
-        else (repo_dir / "runs" / f"pause-resume-oversub-N{args.running_concurrency}-{timestamp}").resolve()
+        else (repo_dir / "runs" / f"{RUN_NAME_PREFIX}-N{args.running_concurrency}-{timestamp}").resolve()
     )
     try:
         selection = selection_records(
