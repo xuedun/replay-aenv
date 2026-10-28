@@ -30,6 +30,8 @@ TIMING_RE = re.compile(
     r"pause=([\d.]+)s delay=([\d.]+)s capacity_wait=([\d.]+)s "
     r"resume=([\d.]+)s command=([\d.]+)s total=([\d.]+)s"
     r"(?: transport=(\w+))?"
+    r"(?: server_exec=(\d+)ms)?"
+    r"(?: binding_generation=(\d+))?"
 )
 TRANSPORT_RE = re.compile(r"transport=(\w+)")
 RESULT_RE = re.compile(
@@ -49,7 +51,7 @@ def summarize_vm(vm_dir: Path) -> dict | None:
     text = job_log.read_text(encoding="utf-8", errors="replace")
 
     pauses, resumes, commands, totals, delays = [], [], [], [], []
-    proxy_pauses, proxy_totals = [], []
+    proxy_pauses, proxy_totals, proxy_cmds, proxy_server_ms = [], [], [], []
     exec_secs, proxy_exec_secs = [], []
     for line in text.splitlines():
         m = TIMING_RE.search(line)
@@ -58,6 +60,7 @@ def summarize_vm(vm_dir: Path) -> dict | None:
                 float(m.group(i)) for i in range(2, 8)
             )
             transport = m.group(8)
+            server_ms = int(m.group(9)) if m.group(9) else None
             pauses.append(pause)
             delays.append(delay)
             commands.append(command)
@@ -65,15 +68,13 @@ def summarize_vm(vm_dir: Path) -> dict | None:
             if transport == "proxy_read":
                 proxy_pauses.append(pause)
                 proxy_totals.append(total)
+                proxy_cmds.append(command)
+                if server_ms is not None:
+                    proxy_server_ms.append(server_ms)
                 proxy_exec_secs.append(command)
             else:
                 resumes.append(resume)
                 exec_secs.append(command)
-            continue
-        r = RESULT_RE.search(line)
-        if r:
-            # Exec latency per step; transport split comes from timing lines,
-            # so only used as a fallback when timing lines are absent.
             continue
 
     e2e = None
@@ -87,28 +88,50 @@ def summarize_vm(vm_dir: Path) -> dict | None:
     return {
         "vm": vm_dir.name,
         "avg_exec_sec": round(avg(exec_secs + proxy_exec_secs), 4),
+        "avg_exec_resume_sec": round(avg(exec_secs), 4),
+        "avg_exec_proxy_read_sec": round(avg(proxy_exec_secs), 4),
         "avg_pause_sec": round(avg(pauses), 4),
+        "avg_pause_resume_sec": round(avg(
+            [p for p, t in zip(pauses, _transports(text)) if t != "proxy_read"]
+        ), 4),
+        "avg_pause_proxy_read_sec": round(avg(proxy_pauses), 4),
         "avg_resume_sec": round(avg(resumes), 4),
-        "avg_proxy_read_sec": round(avg(proxy_exec_secs), 4),
         "avg_e2e_sec": round(e2e if e2e is not None else avg(totals), 4),
+        "avg_step_e2e_sec": round(avg(totals), 4),
         "pause_count": len(pauses),
         "resume_count": len(resumes),
         "proxy_read_count": len(proxy_exec_secs),
         "delay_sec": round(sum(delays), 3),
+        "proxy_server_exec_ms_avg": round(avg(proxy_server_ms), 1),
     }
+
+
+def _transports(text: str) -> list[str]:
+    """Transport per timing line, aligned with the pause list."""
+    out = []
+    for line in text.splitlines():
+        m = TIMING_RE.search(line)
+        if m:
+            out.append(m.group(8) or "resume")
+    return out
 
 
 COLUMNS = [
     "vm",
     "avg_exec_sec",
+    "avg_exec_resume_sec",
+    "avg_exec_proxy_read_sec",
     "avg_pause_sec",
+    "avg_pause_resume_sec",
+    "avg_pause_proxy_read_sec",
     "avg_resume_sec",
-    "avg_proxy_read_sec",
     "avg_e2e_sec",
+    "avg_step_e2e_sec",
     "pause_count",
     "resume_count",
     "proxy_read_count",
     "delay_sec",
+    "proxy_server_exec_ms_avg",
 ]
 
 
@@ -155,11 +178,15 @@ def main() -> int:
     for row in rows:
         print(
             f"  {row['vm'][:40]:<42} "
-            f"exec={row['avg_exec_sec']:.3f} pause={row['avg_pause_sec']:.3f} "
-            f"resume={row['avg_resume_sec']:.3f} proxy={row['avg_proxy_read_sec']:.3f} "
+            f"exec(all)={row['avg_exec_sec']:.3f} "
+            f"exec(resume)={row['avg_exec_resume_sec']:.3f} "
+            f"exec(proxy)={row['avg_exec_proxy_read_sec']:.3f} "
+            f"pause={row['avg_pause_sec']:.3f} "
+            f"resume={row['avg_resume_sec']:.3f} "
             f"e2e={row['avg_e2e_sec']:.3f} "
             f"pause×{row['pause_count']} resume×{row['resume_count']} "
-            f"proxy×{row['proxy_read_count']} delay={row['delay_sec']}s"
+            f"proxy×{row['proxy_read_count']} delay={row['delay_sec']}s "
+            f"server_exec={row['proxy_server_exec_ms_avg']}ms"
         )
     return 0
 
