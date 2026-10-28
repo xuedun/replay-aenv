@@ -512,12 +512,12 @@ resume）：
 ```bash
 # 运行 proxy-read 基准测试（server 需开启 [proxy]）
 python3 scripts/run_proxy_read_oversubscription_benchmark.py \
-  --running-concurrency 8 \
-  --ratios 1,2,4,8 \
-  --repeats 2 \
-  --trajectory-dir ./delay_time_trajectories \
-  --image-map ./image-map.json \
-  --api-url http://127.0.0.1:8000 \
+  --running-concurrency 1 \
+  --ratios 1\
+  --repeats 1 \
+  --trajectory-dir /home/cxd/data/replay \
+  --image-map /home/cxd/data/trajectory-templates.json \
+  --api-url http://127.0.0.1:8002 \
   --command-transport aenv-proxy \
   --cgroup-name aenv \
   --cpu-range 0-159 \
