@@ -1575,6 +1575,100 @@ def aggregate_ratios(
     return rows
 
 
+def compute_sleep_concurrency(steps: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Build a per-second timeline of sleeping vs non-sleeping VM counts.
+
+    Each step has delay_wait_started_at / delay_wait_completed_at timestamps.
+    A VM is "sleeping" during that interval. Sampling at 1-second granularity,
+    we count how many VMs are in sleep at each second, and derive:
+      - sleeping_vms: VMs currently in their delay_wait (model "thinking")
+      - executing_vms: total_vms - sleeping_vms (executing commands or waiting)
+    This tells whether the oversubscription ratio saturates the RUNNING pool.
+    """
+    from datetime import datetime
+
+    def parse_ts(ts: str | None) -> float | None:
+        if not ts:
+            return None
+        try:
+            return datetime.fromisoformat(ts).timestamp()
+        except (ValueError, TypeError):
+            return None
+
+    intervals: list[tuple[float, float]] = []
+    total_vms = set()
+    for row in steps:
+        sid = row.get("sandbox_id") or row.get("task_index")
+        if sid is not None:
+            total_vms.add(sid)
+        start = parse_ts(row.get("delay_wait_started_at"))
+        end = parse_ts(row.get("delay_wait_completed_at"))
+        if start is not None and end is not None and end > start:
+            intervals.append((start, end))
+    if not intervals:
+        return []
+    t0 = min(s for s, _ in intervals)
+    t_end = max(e for _, e in intervals)
+    total = len(total_vms) if total_vms else 1
+
+    timeline = []
+    t = t0
+    while t <= t_end:
+        sleeping = sum(1 for s, e in intervals if s <= t < e)
+        executing = max(0, total - sleeping)
+        timeline.append({
+            "ts": datetime.fromtimestamp(t).astimezone().isoformat(
+                timespec="seconds"),
+            "t_rel_sec": round(t - t0, 1),
+            "total_vms": total,
+            "sleeping_vms": sleeping,
+            "executing_vms": executing,
+            "sleep_pct": round(100.0 * sleeping / total, 1) if total else 0,
+        })
+        t += 1.0
+    return timeline
+
+
+def write_sleep_concurrency_csv(
+    output_root: Path,
+    steps: list[dict[str, Any]],
+) -> None:
+    """Write sleep-concurrency timeline CSV if there is enough data."""
+    timeline = compute_sleep_concurrency(steps)
+    if not timeline:
+        return
+    csv_path = output_root / "sleep-concurrency.csv"
+    columns = [
+        "ts", "t_rel_sec", "total_vms",
+        "sleeping_vms", "executing_vms", "sleep_pct",
+    ]
+    write_csv(csv_path, columns, timeline)
+    # Summary stats
+    active = [row for row in timeline if row["total_vms"] > 0]
+    if not active:
+        return
+    sleep_counts = [row["sleeping_vms"] for row in active]
+    exec_counts = [row["executing_vms"] for row in active]
+    summary = {
+        "total_vms": timeline[0]["total_vms"] if timeline else 0,
+        "timeline_seconds": len(timeline),
+        "sleeping_vms_mean": round(sum(sleep_counts) / len(sleep_counts), 2),
+        "sleeping_vms_max": max(sleep_counts),
+        "executing_vms_mean": round(sum(exec_counts) / len(exec_counts), 2),
+        "executing_vms_max": max(exec_counts),
+        "sleep_pct_mean": round(
+            sum(row["sleep_pct"] for row in active) / len(active), 1),
+    }
+    import json as _json
+    (output_root / "sleep-concurrency-summary.json").write_text(
+        _json.dumps(summary, indent=2), encoding="utf-8")
+    print(
+        f"  [sleep-concurrency] VMs={summary['total_vms']} "
+        f"sleep mean={summary['sleeping_vms_mean']} max={summary['sleeping_vms_max']} "
+        f"exec mean={summary['executing_vms_mean']} max={summary['executing_vms_max']} "
+        f"sleep%={summary['sleep_pct_mean']}% -> {csv_path}")
+
+
 def write_outputs(
     output_root: Path,
     *,
@@ -1591,6 +1685,7 @@ def write_outputs(
     write_csv(output_root / "ratio-summary.csv", RATIO_COLUMNS, ratios)
     write_csv(output_root / "trajectory-detail.csv", TASK_COLUMNS, tasks)
     write_csv(output_root / "step-detail.csv", STEP_COLUMNS, steps)
+    write_sleep_concurrency_csv(output_root, steps)
     report = {
         "generated_at": datetime.now().astimezone().isoformat(timespec="seconds"),
         "configuration": {
