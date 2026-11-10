@@ -263,7 +263,12 @@ def extract_cgroup_metrics(metrics: list[dict]) -> dict:
     }
 
 
-def plot_cgroup_metrics(data: dict, output_path: Path, title: str = ""):
+def plot_cgroup_metrics(
+    data: dict,
+    output_path: Path,
+    title: str = "",
+    cpu_limit: int = 384,
+):
     """Plot cgroup CPU and memory curves side by side."""
     fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(14, 8), sharex=True)
 
@@ -275,6 +280,8 @@ def plot_cgroup_metrics(data: dict, output_path: Path, title: str = ""):
         ax1.plot(elapsed, data["cg_cpu"], "b-", linewidth=1, label="cgroup CPU (cores)")
         ax1.plot(elapsed, data["cg_cpu_user"], "g-", linewidth=0.5, alpha=0.7, label="cgroup user")
         ax1.plot(elapsed, data["cg_cpu_sys"], "r-", linewidth=0.5, alpha=0.7, label="cgroup sys")
+        ax1.axhline(y=cpu_limit, color="red", linestyle="--", linewidth=2,
+                     alpha=0.8, label=f"CPU limit ({cpu_limit} cores)")
         ax1.set_ylabel("cgroup CPU (cores)")
     else:
         ax1.plot(elapsed, data["host_cpu_pct"], "b-", linewidth=1, label="Host CPU (%)")
@@ -336,7 +343,7 @@ def write_cgroup_csv(data: dict, csv_path: Path):
             })
 
 
-def process_observability(results_dir: Path, output_dir: Path):
+def process_observability(results_dir: Path, output_dir: Path, cpu_limit: int = 384):
     """Extract cgroup metrics and plot CPU/mem curves."""
     obs_dir = output_dir / "observability"
     obs_dir.mkdir(parents=True, exist_ok=True)
@@ -370,7 +377,7 @@ def process_observability(results_dir: Path, output_dir: Path):
 
         # Plot
         png_path = obs_dir / f"cgroup_cpu_mem_{label}.png"
-        plot_cgroup_metrics(data, png_path, title=f"cgroup CPU/Mem ({label})")
+        plot_cgroup_metrics(data, png_path, title=f"cgroup CPU/Mem ({label})", cpu_limit=cpu_limit)
 
     print(f"[observability] Done: {obs_dir}/")
 
@@ -380,13 +387,26 @@ def process_observability(results_dir: Path, output_dir: Path):
 
 def main():
     if len(sys.argv) < 3:
-        print(f"Usage: {sys.argv[0]} <results_dir> <output_dir>")
+        print(f"Usage: {sys.argv[0]} <results_dir> <output_dir> [--cpu-limit N]")
         print(f"  results_dir  - runs/pause-resume-oversub-N8-xxx/")
         print(f"  output_dir   - where to write CSVs and PNGs")
+        print(f"  --cpu-limit  - total CPU cores for reference line (default: 384)")
         return 1
 
-    results_dir = Path(sys.argv[1]).resolve()
-    output_dir = Path(sys.argv[2]).resolve()
+    args = sys.argv[1:]
+    cpu_limit = 384
+    if "--cpu-limit" in args:
+        idx = args.index("--cpu-limit")
+        if idx + 1 < len(args):
+            try:
+                cpu_limit = int(args[idx + 1])
+                args = args[:idx] + args[idx + 2:]
+            except ValueError:
+                print(f"ERROR: --cpu-limit must be an integer, got: {args[idx + 1]}")
+                return 1
+
+    results_dir = Path(args[0]).resolve()
+    output_dir = Path(args[1]).resolve()
 
     if not results_dir.is_dir():
         print(f"ERROR: results dir not found: {results_dir}")
@@ -400,7 +420,7 @@ def main():
 
     process_vm_timings(results_dir, output_dir)
     print()
-    process_observability(results_dir, output_dir)
+    process_observability(results_dir, output_dir, cpu_limit=cpu_limit)
     print()
     print("Done.")
     return 0
