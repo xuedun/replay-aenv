@@ -14,6 +14,7 @@ Outputs:
   │   ├── vm_0002.csv
   │   └── ...
   ├── vm_summary.csv           # per-VM averages
+  ├── case_summary.csv         # per-case aggregation across VMs (real VMs only)
   └── observability/
       ├── cgroup_cpu_mem_ratio01_repeat01.png
       └── cgroup_cpu_mem_ratio02_repeat01.png
@@ -21,6 +22,7 @@ Outputs:
 import csv
 import json
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -114,6 +116,8 @@ def process_vm_timings(results_dir: Path, output_dir: Path):
     ]
 
     summary_rows = []
+    case_rows = []
+    noise_vm_count = 0
     for idx, result_path in enumerate(result_files, 1):
         try:
             result = json.loads(result_path.read_text(encoding="utf-8"))
@@ -124,6 +128,10 @@ def process_vm_timings(results_dir: Path, output_dir: Path):
         steps, scenario = extract_step_timings(result)
         if not steps:
             continue
+
+        is_noise = is_noise_vm(result_path)
+        if is_noise:
+            noise_vm_count += 1
 
         vm_name = f"vm_{idx:04d}"
         # Try to get a meaningful name from the directory
@@ -146,6 +154,21 @@ def process_vm_timings(results_dir: Path, output_dir: Path):
 
         sandbox_id = result.get("sandbox_id", "")
         succeeded = result.get("succeeded", False)
+
+        if not is_noise:
+            # Case aggregation only considers real VMs (noise-fill excluded).
+            case_rows.append({
+                "case": extract_case_name(result, result_path),
+                "scenario": scenario,
+                "wall_sec": (
+                    float(result["elapsed_sec"])
+                    if result.get("elapsed_sec") is not None
+                    else None
+                ),
+                "total_exec_sec": sum(s["exec_sec"] for s in steps),
+                "actions": len(steps),
+                "succeeded": bool(succeeded),
+            })
 
         summary_rows.append({
             "vm": vm_name,
@@ -180,6 +203,102 @@ def process_vm_timings(results_dir: Path, output_dir: Path):
 
     print(f"[vm_timings] Per-VM CSVs: {vm_dir}/ ({len(summary_rows)} VMs)")
     print(f"[vm_timings] Summary: {summary_path}")
+    if noise_vm_count:
+        print(f"[vm_timings] Noise-fill VMs excluded from case summary: {noise_vm_count}")
+
+    if case_rows:
+        write_case_summary(case_rows, output_dir)
+
+
+# ── Part 1b: Case summary (aggregate VMs of the same case) ───
+
+
+def extract_case_name(result_json: dict, result_path: Path) -> str:
+    """Identify the replayed case (trajectory) for one VM run.
+
+    Priority: trajectory_path stem > instance_id > parent dir name.
+    """
+    trajectory_path = result_json.get("trajectory_path") or ""
+    if trajectory_path:
+        stem = Path(trajectory_path).name
+        for suffix in (".replay.json", ".json", ".traj"):
+            if stem.endswith(suffix):
+                stem = stem[: -len(suffix)]
+                break
+        if stem:
+            return stem
+    instance_id = result_json.get("instance_id") or ""
+    if instance_id:
+        return str(instance_id)
+    return result_path.parent.name
+
+
+def is_noise_vm(result_path: Path) -> bool:
+    """Noise-fill runs use rollout-*-noise-* output dirs; real ones use *-real-*.
+
+    Only the immediate parent directory name is checked, so a results root or
+    trajectory name containing "noise" does not cause false positives.
+    """
+    return bool(re.match(r"rollout-\d+-noise", result_path.parent.name))
+
+
+def _median(values: list[float]) -> float:
+    if not values:
+        return 0.0
+    ordered = sorted(values)
+    n = len(ordered)
+    if n % 2 == 1:
+        return ordered[n // 2]
+    return (ordered[n // 2 - 1] + ordered[n // 2]) / 2
+
+
+def write_case_summary(
+    case_rows: list[dict],
+    output_dir: Path,
+) -> None:
+    """Aggregate per-VM wall times per case (real VMs only) into case_summary.csv."""
+    cases: dict[str, list[dict]] = {}
+    for row in case_rows:
+        cases.setdefault(row["case"], []).append(row)
+
+    summary_rows = []
+    for case in sorted(cases, key=lambda c: (len(c), c)):
+        runs = cases[case]
+        wall = [r["wall_sec"] for r in runs if r["wall_sec"] is not None]
+        execs = [r["total_exec_sec"] for r in runs]
+        n = len(runs)
+        succeeded = sum(1 for r in runs if r["succeeded"])
+        summary_rows.append({
+            "case": case,
+            "scenario": runs[0]["scenario"],
+            "vms": n,
+            "succeeded": succeeded,
+            "succeeded_ratio": round(succeeded / n, 4) if n else 0,
+            "avg_wall_sec": round(sum(wall) / len(wall), 4) if wall else "",
+            "median_wall_sec": round(_median(wall), 4) if wall else "",
+            "min_wall_sec": round(min(wall), 4) if wall else "",
+            "max_wall_sec": round(max(wall), 4) if wall else "",
+            "avg_total_exec_sec": round(sum(execs) / n, 4) if n else 0,
+            "avg_actions": round(sum(r["actions"] for r in runs) / n, 2) if n else 0,
+        })
+
+    summary_path = output_dir / "case_summary.csv"
+    fields = [
+        "case", "scenario", "vms", "succeeded", "succeeded_ratio",
+        "avg_wall_sec", "median_wall_sec", "min_wall_sec", "max_wall_sec",
+        "avg_total_exec_sec", "avg_actions",
+    ]
+    with open(summary_path, "w", newline="", encoding="utf-8-sig") as f:
+        writer = csv.DictWriter(f, fieldnames=fields, extrasaction="ignore")
+        writer.writeheader()
+        writer.writerows(summary_rows)
+
+    print(f"[case_summary] Real VMs per case: {summary_path}")
+    for row in summary_rows:
+        print(
+            f"  case={row['case']} vms={row['vms']} ok={row['succeeded']}/{row['vms']} "
+            f"avg_wall={row['avg_wall_sec']}s median={row['median_wall_sec']}s"
+        )
 
 
 # ── Part 2: Cgroup CPU/Mem from observability ───────────────
