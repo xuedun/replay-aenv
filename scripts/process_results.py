@@ -219,10 +219,16 @@ def extract_cgroup_metrics(metrics: list[dict]) -> dict:
     host_mem_cached = []
     elapsed = []
 
+    # Accumulate per-sample interval_s into a monotonic elapsed axis.
+    # The old code fell back to the raw interval_s value (always 1.0) when
+    # "elapsed_s" was absent from the JSONL, which collapsed every x-axis
+    # point onto 1.0 and squashed the plotted curves.
+    elapsed_running = 0.0
+
     for m in metrics:
         ts = m.get("ts", "")
         t = m.get("interval_s", 0)
-        e = m.get("elapsed_s", 0) if "elapsed_s" in m else t
+        elapsed_running += float(t) if t else 0.0
 
         # Prioritize cgroup fields; fall back to host fields
         cpu = m.get("cgroup_cpu_cores", m.get("cpu_pct", 0))
@@ -231,7 +237,7 @@ def extract_cgroup_metrics(metrics: list[dict]) -> dict:
         mem_c = m.get("cgroup_mem_cache_gb", m.get("mem_cached_gb", 0))
 
         timestamps.append(ts)
-        elapsed.append(e)
+        elapsed.append(round(elapsed_running, 3))
         cg_cpu.append(float(cpu) if cpu is not None else 0)
         cg_cpu_user.append(float(m.get("cgroup_cpu_user_cores", 0)))
         cg_cpu_sys.append(float(m.get("cgroup_cpu_sys_cores", 0)))
