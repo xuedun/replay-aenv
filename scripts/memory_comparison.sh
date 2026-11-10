@@ -29,6 +29,8 @@ COUNT=50
 API_URL="http://localhost:8002"
 OUTPUT_ROOT=""
 WORKDIR="/"
+DELAY=0
+SINGLE_CASE_LIMIT=3
 BENCH_SCRIPT="scripts/run_no_lifecycle_oversubscription_benchmark.py"
 VENV_PY=".venv/bin/python"
 
@@ -41,6 +43,8 @@ while [[ $# -gt 0 ]]; do
         --api-url)     API_URL="$2";     shift 2 ;;
         --output-root) OUTPUT_ROOT="$2"; shift 2 ;;
         --workdir)     WORKDIR="$2";     shift 2 ;;
+        --delay)       DELAY="$2";       shift 2 ;;
+        --single-cases) SINGLE_CASE_LIMIT="$2"; shift 2 ;;
         *) echo "未知参数: $1"; exit 1 ;;
     esac
 done
@@ -55,6 +59,8 @@ echo "=================================================================="
 echo "  内存对比测试: ${COUNT} 个不同 case vs 单 case × ${COUNT} VM"
 echo "  开始时间: ${STAMP}"
 echo "  输出目录: ${OUTPUT_ROOT}"
+echo "  delay: ${DELAY}s (0=无延迟满速)"
+echo "  单case测试数: ${SINGLE_CASE_LIMIT}"
 echo "=================================================================="
 echo ""
 
@@ -117,7 +123,7 @@ run_bench() {
         --workdir "$WORKDIR" \
         --ratios 1 \
         --repeats 1 \
-        --delay 0 \
+        --delay "$DELAY" \
         --rollout 1 \
         --launch-interval-sec 0.5 \
         --cgroup-name aenv.slice \
@@ -153,7 +159,7 @@ echo "─── 场景 B: 单 case × ${COUNT} VM（循环每个 case） ──�
 echo ""
 
 # 取轨迹目录中的前几个 case（默认取 3 个做对比，可改）
-SINGLE_CASES=$(ls "$TRAJ_DIR"/*.json 2>/dev/null | head -3)
+SINGLE_CASES=$(ls "$TRAJ_DIR"/*.json 2>/dev/null | head -$SINGLE_CASE_LIMIT)
 if [ -z "$SINGLE_CASES" ]; then
     echo "ERROR: 轨迹目录中没有 .json 文件"
     exit 1
