@@ -411,6 +411,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Number of VMs launched per batch with no pacing inside the batch (default: 1)",
     )
     parser.add_argument(
+        "--numa-bind",
+        action="store_true",
+        default=False,
+        help="Bind sandbox firecracker processes to NUMA nodes (VMs split evenly, 4 groups on a 4-node host)",
+    )
+    parser.add_argument(
         "--extra-delay-sec",
         type=nonnegative_float,
         default=0.0,
@@ -829,6 +835,8 @@ def command_for_trial(
         "--output-dir",
         str(output_dir),
     ]
+    if getattr(args, "numa_bind", False):
+        command.append("--numa-bind")
     if args.stop_on_error:
         command.append("--stop-on-error")
     if args.command_timeout_continue:

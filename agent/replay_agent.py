@@ -1,5 +1,10 @@
 from __future__ import annotations
 
+try:  # shared helper (package layout or direct script execution)
+    from . import numa_binding
+except ImportError:
+    import numa_binding
+
 import argparse
 import asyncio
 import hashlib
@@ -131,6 +136,9 @@ class ReplayOptions:
     command_transport: str = "aenv-proxy"
     direct_envd_port: int = 49_983
     extra_delay_sec: float = 0.0
+    numa_bind: bool = False
+    numa_index: int = 0
+    numa_total: int = 1
 
 
 class SandboxInfrastructureError(RuntimeError):
@@ -856,6 +864,28 @@ class ReplayRunner:
             f"Created sandbox {self.sandbox_id} create_attempts={create_attempts}",
         )
 
+        if getattr(self.options, "numa_bind", False) and self.sandbox_id:
+            numa_report = await numa_binding.bind_sandbox_to_numa(
+                self.sandbox_id,
+                index=getattr(self.options, "numa_index", 0),
+                total=max(1, getattr(self.options, "numa_total", 1)),
+            )
+            self._event(
+                "info" if numa_report.get("applied") else "warn",
+                "NUMA bind sandbox={sid} vm_index={idx}/{total} "
+                "node={node} cpulist={cpulist} pid={pid} "
+                "applied={applied} reason={reason}".format(
+                    sid=self.sandbox_id,
+                    idx=numa_report.get("index"),
+                    total=numa_report.get("total"),
+                    node=numa_report.get("node"),
+                    cpulist=numa_report.get("cpulist"),
+                    pid=numa_report.get("pid", ""),
+                    applied=numa_report.get("applied"),
+                    reason=numa_report.get("reason", ""),
+                ),
+            )
+
     async def _dispatch_command(self, command: str, timeout_sec: int | None) -> Any:
         if self.sandbox is None:
             raise RuntimeError("Sandbox is not available")
@@ -1370,6 +1400,25 @@ class ReplayRunner:
             if self.options.ready_probe_enabled
             else None
         )
+        if getattr(self.options, "numa_bind", False) and self.sandbox_id:
+            # Resume spawns a fresh firecracker process; re-pin it so the
+            # lazily faulted guest memory stays NUMA-local after restore.
+            numa_report = await numa_binding.bind_sandbox_to_numa(
+                self.sandbox_id,
+                index=getattr(self.options, "numa_index", 0),
+                total=max(1, getattr(self.options, "numa_total", 1)),
+            )
+            self._event(
+                "info" if numa_report.get("applied") else "warn",
+                "NUMA rebind after resume sandbox={sid} "
+                "node={node} pid={pid} applied={applied} reason={reason}".format(
+                    sid=self.sandbox_id,
+                    node=numa_report.get("node"),
+                    pid=numa_report.get("pid", ""),
+                    applied=numa_report.get("applied"),
+                    reason=numa_report.get("reason", ""),
+                ),
+            )
         return {
             "resume_started_at": started_at,
             "resume_completed_at": completed_at,
@@ -1983,6 +2032,7 @@ def replay_options_from_args(args: argparse.Namespace) -> ReplayOptions:
         command_transport=args.command_transport,
         direct_envd_port=args.direct_envd_port,
         extra_delay_sec=getattr(args, "extra_delay_sec", 0.0),
+        numa_bind=getattr(args, "numa_bind", False),
     )
 
 
@@ -2255,6 +2305,7 @@ async def run_batch(args: argparse.Namespace) -> int:
         f"control_plane_inflight_cap={control_plane_config.inflight_cap} "
         f"launch_interval_sec={args.launch_interval_sec:.3f} "
         f"launch_batch_size={getattr(args, 'launch_batch_size', 1)} "
+        f"numa_bind={getattr(args, 'numa_bind', False)} "
         f"write_mode={args.write_mode} "
         f"template={args.template if mixed_config is None else 'mixed'} "
         f"trajectory_source={Path(args.trajectory_dir).expanduser().resolve()} "
@@ -2302,7 +2353,12 @@ async def run_batch(args: argparse.Namespace) -> int:
                 result = await ReplayRunner(
                     path,
                     run_dir,
-                    replace(options, template=scheduled.template or options.template),
+                    replace(
+                        options,
+                        template=scheduled.template or options.template,
+                        numa_index=index,
+                        numa_total=len(scheduled_trajectories),
+                    ),
                     console_output=False,
                     control_plane_scheduler=control_plane_scheduler,
                     running_slot_scheduler=running_slot_scheduler,
@@ -2724,6 +2780,15 @@ def add_batch_runtime_arguments(parser: argparse.ArgumentParser) -> None:
         help=(
             "Number of VMs launched per batch with no pacing inside the batch; "
             "launch-interval-sec applies between batches (default: 1)"
+        ),
+    )
+    parser.add_argument(
+        "--numa-bind",
+        action="store_true",
+        default=False,
+        help=(
+            "Bind each sandbox's firecracker process to a NUMA node: VMs are "
+            "split into contiguous equal groups (four on a four-node host)"
         ),
     )
     parser.add_argument(
