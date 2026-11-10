@@ -2218,6 +2218,8 @@ async def run_batch(args: argparse.Namespace) -> int:
         raise ValueError("control-plane-max-inflight must be a positive integer")
     if args.launch_interval_sec < 0:
         raise ValueError("launch-interval-sec must be non-negative")
+    if getattr(args, "launch_batch_size", 1) < 1:
+        raise ValueError("launch-batch-size must be a positive integer")
     batch_started_at = absolute_timestamp()
     batch_started = time.perf_counter()
     batch_id = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
@@ -2241,20 +2243,26 @@ async def run_batch(args: argparse.Namespace) -> int:
     running_slot_scheduler = RunningSlotScheduler(running_concurrency)
     launch_lock = asyncio.Lock()
     next_launch_at = time.perf_counter()
+    launch_batch_count = 0
 
     async def wait_for_launch_turn() -> None:
-        """Space actual replay starts without allowing catch-up bursts."""
+        """Launch VMs in batches: no pacing inside a batch, interval between batches."""
 
-        nonlocal next_launch_at
+        nonlocal next_launch_at, launch_batch_count
         if args.launch_interval_sec <= 0:
             return
+        batch_size = max(1, getattr(args, "launch_batch_size", 1))
         async with launch_lock:
             now = time.perf_counter()
             wait_sec = max(0.0, next_launch_at - now)
             if wait_sec > 0:
                 await asyncio.sleep(wait_sec)
             launched_at = time.perf_counter()
-            next_launch_at = launched_at + args.launch_interval_sec
+            launch_batch_count += 1
+            # Advance the pacing turnstile once per completed batch so the
+            # next batch waits launch-interval-sec before starting.
+            if launch_batch_count % batch_size == 0:
+                next_launch_at = launched_at + args.launch_interval_sec
 
     async def write_job_event(
         level: str,
@@ -2284,6 +2292,7 @@ async def run_batch(args: argparse.Namespace) -> int:
         f"control_plane_qps={args.control_plane_qps:.3f} "
         f"control_plane_inflight_cap={control_plane_config.inflight_cap} "
         f"launch_interval_sec={args.launch_interval_sec:.3f} "
+        f"launch_batch_size={getattr(args, 'launch_batch_size', 1)} "
         f"template={args.template if mixed_config is None else 'mixed'} "
         f"trajectory_source={Path(args.trajectory_dir).expanduser().resolve()} "
         f"output_dir={batch_dir}",
@@ -2784,6 +2793,15 @@ def add_batch_runtime_arguments(parser: argparse.ArgumentParser) -> None:
         help=(
             "Minimum interval in seconds between actual replay job starts; "
             "0 starts jobs without pacing (default: 0)"
+        ),
+    )
+    parser.add_argument(
+        "--launch-batch-size",
+        type=int,
+        default=1,
+        help=(
+            "Number of VMs launched per batch with no pacing inside the batch; "
+            "launch-interval-sec applies between batches (default: 1)"
         ),
     )
     parser.add_argument(

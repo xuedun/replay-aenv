@@ -405,6 +405,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--launch-interval-sec", type=nonnegative_float, default=0.0)
     parser.add_argument(
+        "--launch-batch-size",
+        type=positive_int,
+        default=1,
+        help="Number of VMs launched per batch with no pacing inside the batch (default: 1)",
+    )
+    parser.add_argument(
         "--extra-delay-sec",
         type=nonnegative_float,
         default=0.0,
@@ -803,6 +809,8 @@ def command_for_trial(
         str(args.control_plane_max_inflight),
         "--launch-interval-sec",
         str(args.launch_interval_sec),
+        "--launch-batch-size",
+        str(getattr(args, "launch_batch_size", 1)),
         "--extra-delay-sec",
         str(args.extra_delay_sec),
         "--workdir",
