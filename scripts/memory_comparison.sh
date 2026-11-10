@@ -88,6 +88,19 @@ echo "[前置检查] server OK, 模板数量: $(aenv template list 2>/dev/null |
 echo ""
 
 # ── 工具函数 ──────────────────────────────────────────────────────────────────
+drop_page_cache() {
+    # 清空 page cache / dentries / inodes，保证冷启动
+    sync
+    echo 3 > /proc/sys/vm/drop_caches 2>/dev/null || \
+        sudo sh -c 'echo 3 > /proc/sys/vm/drop_caches' 2>/dev/null || \
+        echo "  [warn] drop_caches 需要 root，跳过"
+    # 等待回收完成
+    sleep 2
+    # 打印当前可用内存
+    local mem_available
+    mem_available=$(awk '/MemAvailable/ {printf "%.1f", $2/1024/1024}' /proc/meminfo)
+    echo "  [cache] 已清理, 当前可用内存: ${mem_available}GB"
+}
 extract_peak() {
     # 从 metrics_1s.jsonl 中提取 cgroup_mem_usage_gb 峰值
     local obs_dir="$1"
@@ -144,6 +157,10 @@ run_bench() {
 echo "─── 场景 A: ${COUNT} 个不同 case（混合） ───"
 echo ""
 
+echo "[cache] 清理 page cache ..."
+drop_page_cache
+echo ""
+
 run_bench "$TRAJ_DIR" "A-mix-${COUNT}cases"
 
 MIX_PEAK=$(extract_peak "$OUTPUT_ROOT/A-mix-${COUNT}cases/ratio-01/repeat-01/observability")
@@ -156,6 +173,10 @@ echo ""
 
 # ── 场景 B: 单 case × N 个 VM（逐个 case 测试）────────────────────────────────
 echo "─── 场景 B: 单 case × ${COUNT} VM（循环每个 case） ───"
+echo ""
+
+echo "[cache] 清理 page cache ..."
+drop_page_cache
 echo ""
 
 # 取轨迹目录中的前几个 case（默认取 3 个做对比，可改）
@@ -173,6 +194,7 @@ for traj_file in $SINGLE_CASES; do
     short_name="${case_name:0:30}"
 
     echo "  ── [B] case: $short_name ──"
+    drop_page_cache
 
     # 建单 case 临时目录
     tmp_dir="/tmp/mem-cmp-single-$RANDOM"
