@@ -14,7 +14,8 @@ Outputs:
   │   ├── vm_0002.csv
   │   └── ...
   ├── vm_summary.csv           # per-VM averages
-  ├── case_summary.csv         # per-case aggregation across VMs (real VMs only)
+  ├── case_summary.csv         # per-case wall/exec stats (avg/P50/P95/P99, real VMs only)
+  ├── mpki_summary.csv         # global L3 MPKI stats per metrics file (when collected)
   └── observability/
       ├── cgroup_cpu_mem_ratio01_repeat01.png
       └── cgroup_cpu_mem_ratio02_repeat01.png
@@ -252,6 +253,20 @@ def _median(values: list[float]) -> float:
     return (ordered[n // 2 - 1] + ordered[n // 2]) / 2
 
 
+def _percentile(values: list[float], q: float) -> float:
+    """Linear-interpolation percentile (numpy 'linear' method)."""
+    if not values:
+        return 0.0
+    ordered = sorted(values)
+    if len(ordered) == 1:
+        return ordered[0]
+    pos = (len(ordered) - 1) * q / 100.0
+    lo = int(pos)
+    hi = min(lo + 1, len(ordered) - 1)
+    frac = pos - lo
+    return ordered[lo] * (1.0 - frac) + ordered[hi] * frac
+
+
 def write_case_summary(
     case_rows: list[dict],
     output_dir: Path,
@@ -274,19 +289,28 @@ def write_case_summary(
             "vms": n,
             "succeeded": succeeded,
             "succeeded_ratio": round(succeeded / n, 4) if n else 0,
+            # wall: avg / P50 / P95 / P99 (+ min/max)
             "avg_wall_sec": round(sum(wall) / len(wall), 4) if wall else "",
             "median_wall_sec": round(_median(wall), 4) if wall else "",
+            "wall_p95_sec": round(_percentile(wall, 95), 4) if wall else "",
+            "wall_p99_sec": round(_percentile(wall, 99), 4) if wall else "",
             "min_wall_sec": round(min(wall), 4) if wall else "",
             "max_wall_sec": round(max(wall), 4) if wall else "",
+            # exec (sum of per-step command times): avg / P50 / P95 / P99
             "avg_total_exec_sec": round(sum(execs) / n, 4) if n else 0,
+            "exec_p50_sec": round(_percentile(execs, 50), 4) if execs else "",
+            "exec_p95_sec": round(_percentile(execs, 95), 4) if execs else "",
+            "exec_p99_sec": round(_percentile(execs, 99), 4) if execs else "",
             "avg_actions": round(sum(r["actions"] for r in runs) / n, 2) if n else 0,
         })
 
     summary_path = output_dir / "case_summary.csv"
     fields = [
         "case", "scenario", "vms", "succeeded", "succeeded_ratio",
-        "avg_wall_sec", "median_wall_sec", "min_wall_sec", "max_wall_sec",
-        "avg_total_exec_sec", "avg_actions",
+        "avg_wall_sec", "median_wall_sec", "wall_p95_sec", "wall_p99_sec",
+        "min_wall_sec", "max_wall_sec",
+        "avg_total_exec_sec", "exec_p50_sec", "exec_p95_sec", "exec_p99_sec",
+        "avg_actions",
     ]
     with open(summary_path, "w", newline="", encoding="utf-8-sig") as f:
         writer = csv.DictWriter(f, fieldnames=fields, extrasaction="ignore")
@@ -297,7 +321,9 @@ def write_case_summary(
     for row in summary_rows:
         print(
             f"  case={row['case']} vms={row['vms']} ok={row['succeeded']}/{row['vms']} "
-            f"avg_wall={row['avg_wall_sec']}s median={row['median_wall_sec']}s"
+            f"wall avg={row['avg_wall_sec']}s p50={row['median_wall_sec']}s "
+            f"p95={row['wall_p95_sec']}s p99={row['wall_p99_sec']}s "
+            f"exec avg={row['avg_total_exec_sec']}s p95={row['exec_p95_sec']}s"
         )
 
 
@@ -462,6 +488,51 @@ def write_cgroup_csv(data: dict, csv_path: Path):
             })
 
 
+def aggregate_l3_mpki(metrics: list[dict]) -> dict | None:
+    """Global per-run L3 MPKI statistics from per-domain per-sample l3_* fields.
+
+    The headline number is the instruction-weighted global MPKI:
+    sum(l3_misses_s) / sum(l3_instr_s) * 1000 -- the physically meaningful
+    aggregate (a simple mean of per-domain MPKI values would re-weight idle
+    domains equally and dilute hot ones). The simple mean and the hottest
+    domain are reported alongside for reference.
+    """
+    m_sum = i_sum = 0.0
+    mpki_vals: list[float] = []
+    domain_means: dict[int, list[float]] = {}
+    samples = 0
+    for m in metrics:
+        misses = m.get("l3_misses_s") or {}
+        instr = m.get("l3_instr_s") or {}
+        mpki = m.get("l3_mpki") or {}
+        if not misses and not mpki:
+            continue
+        samples += 1
+        for v in misses.values():
+            if isinstance(v, (int, float)):
+                m_sum += float(v)
+        for v in instr.values():
+            if isinstance(v, (int, float)):
+                i_sum += float(v)
+        for d, v in mpki.items():
+            if isinstance(v, (int, float)):
+                mpki_vals.append(float(v))
+                domain_means.setdefault(int(d), []).append(float(v))
+    if samples == 0:
+        return None
+    dom_means = {d: sum(vs) / len(vs) for d, vs in domain_means.items()}
+    hottest = max(dom_means, key=dom_means.get) if dom_means else None
+    return {
+        "mpki_samples": samples,
+        "domains": len(dom_means),
+        "mpki_weighted_global": round(m_sum / i_sum * 1000.0, 3) if i_sum > 0 else "",
+        "mpki_mean": round(sum(mpki_vals) / len(mpki_vals), 3) if mpki_vals else "",
+        "mpki_max_domain_mean": round(max(dom_means.values()), 3) if dom_means else "",
+        "hottest_domain": hottest if hottest is not None else "",
+        "hottest_domain_mean": round(dom_means[hottest], 3) if hottest is not None else "",
+    }
+
+
 def process_observability(results_dir: Path, output_dir: Path, cpu_limit: int = 384):
     """Extract cgroup metrics and plot CPU/mem curves."""
     obs_dir = output_dir / "observability"
@@ -474,6 +545,7 @@ def process_observability(results_dir: Path, output_dir: Path, cpu_limit: int = 
 
     print(f"[observability] Found {len(metrics_files)} metrics files")
 
+    mpki_rows = []
     for metrics_path in metrics_files:
         # Derive a label from the path: ratio-XX/repeat-YY
         parts = metrics_path.parts
@@ -489,6 +561,11 @@ def process_observability(results_dir: Path, output_dir: Path, cpu_limit: int = 
 
         data = extract_cgroup_metrics(metrics)
 
+        # Global L3 MPKI statistics (only when the monitor collected them)
+        mpki_stats = aggregate_l3_mpki(metrics)
+        if mpki_stats is not None:
+            mpki_rows.append({"label": label, **mpki_stats})
+
         # Write CSV
         csv_path = obs_dir / f"cgroup_{label}.csv"
         write_cgroup_csv(data, csv_path)
@@ -497,6 +574,24 @@ def process_observability(results_dir: Path, output_dir: Path, cpu_limit: int = 
         # Plot
         png_path = obs_dir / f"cgroup_cpu_mem_{label}.png"
         plot_cgroup_metrics(data, png_path, title=f"cgroup CPU/Mem ({label})", cpu_limit=cpu_limit)
+
+    if mpki_rows:
+        mpki_path = output_dir / "mpki_summary.csv"
+        mpki_fields = [
+            "label", "mpki_weighted_global", "mpki_mean", "mpki_max_domain_mean",
+            "hottest_domain", "hottest_domain_mean", "domains", "mpki_samples",
+        ]
+        with open(mpki_path, "w", newline="", encoding="utf-8-sig") as f:
+            writer = csv.DictWriter(f, fieldnames=mpki_fields, extrasaction="ignore")
+            writer.writeheader()
+            writer.writerows(mpki_rows)
+        print(f"[mpki] L3 MPKI global stats: {mpki_path}")
+        for row in mpki_rows:
+            print(
+                f"  {row['label']}: weighted_global={row['mpki_weighted_global']} "
+                f"mean={row['mpki_mean']} hottest=domain{row['hottest_domain']}"
+                f"({row['hottest_domain_mean']}) over {row['domains']} domains"
+            )
 
     print(f"[observability] Done: {obs_dir}/")
 
