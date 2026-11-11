@@ -215,9 +215,23 @@ def load_trajectory(path: str | Path) -> tuple[str, str, list[ReplayStep]]:
         raise FileNotFoundError(f"Trajectory not found: {trajectory_path}")
 
     try:
-        data: Any = json.loads(trajectory_path.read_text(encoding="utf-8"))
+        # utf-8-sig transparently strips a UTF-8 BOM: files edited/saved by
+        # Windows or PowerShell tools otherwise fail with
+        # "Expecting value: line 1 column 1 (char 0)" despite valid content.
+        data: Any = json.loads(trajectory_path.read_text(encoding="utf-8-sig"))
     except json.JSONDecodeError as exc:
-        raise ValueError(f"Invalid trajectory JSON: {trajectory_path}: {exc}") from exc
+        # Rich context: file size + leading bytes distinguish empty files,
+        # BOM-only files and text/HTML corruption at a glance.
+        try:
+            size = trajectory_path.stat().st_size
+            head_repr = repr(trajectory_path.read_bytes()[:32])
+        except OSError:
+            size = -1
+            head_repr = "(unreadable)"
+        raise ValueError(
+            f"Invalid trajectory JSON: {trajectory_path}: {exc} "
+            f"(size={size} bytes, first-bytes={head_repr})"
+        ) from exc
 
     if not isinstance(data, dict):
         raise ValueError("Trajectory root must be a JSON object")
