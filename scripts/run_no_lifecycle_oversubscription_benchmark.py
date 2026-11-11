@@ -426,6 +426,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="Domain level for --ccl-bind (default: auto = L3, else NUMA, else socket)",
     )
     parser.add_argument(
+        "--mpki-events",
+        default=None,
+        help=(
+            "Comma-separated perf events for the observability monitor's "
+            "per-L3-domain MPKI sampling, ordered: miss-event,aux-event,"
+            "instruction-event (default: LLC-load-misses,LLC-loads,instructions)"
+        ),
+    )
+    parser.add_argument(
         "--extra-delay-sec",
         type=nonnegative_float,
         default=0.0,
@@ -847,6 +856,8 @@ def command_for_trial(
     if getattr(args, "ccl_bind", False):
         command.append("--ccl-bind")
         command.extend(["--ccl-granularity", str(getattr(args, "ccl_granularity", "auto"))])
+    if getattr(args, "mpki_events", None):
+        command.extend(["--mpki-events", str(args.mpki_events)])
     if args.stop_on_error:
         command.append("--stop-on-error")
     if args.command_timeout_continue:

@@ -542,13 +542,45 @@ class L3MpkiSampler:
     paranoid level, event unsupported) is warned once and omitted.
     """
 
-    def __init__(self, interval_sec=1.0):
+    def __init__(self, interval_sec=1.0, events=None):
+        # Event roles by position: [0]=misses, middle=loads (aux), [-1]=instructions.
+        # Override (e.g. arch-specific raw events) via --mpki-events, ordered the
+        # same way: miss-event,aux-event,instruction-event.
+        self._events = tuple(events) if events else MPKI_EVENTS
+        if len(self._events) < 2:
+            print("mpki: WARNING need at least miss,instruction events; skipping")
+            self._events = ()
         self._interval_sec = max(0.25, float(interval_sec))
         self._procs = {}
         self._tasks = {}
         self._latest = {}   # domain_idx -> {"misses": n, "loads": n, "instr": n}
         self._failed = set()
         self._domains = []
+
+    async def _probe_events(self, perf):
+        """One-shot `perf stat -a -x, -e <events> -- sleep 0.3` to detect events
+        this kernel/PMU does not support (prints `<not supported>`). Returns a
+        set of unsupported event names, or None when indeterminate (probe could
+        not run; keep the long-running processes and let them show it)."""
+        if not self._events:
+            return set(self._events)
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                perf, "stat", "-a", "-x", ",", "-e", ",".join(self._events), "--", "sleep", "0.3",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+            )
+            out, _ = await asyncio.wait_for(proc.communicate(), timeout=15)
+        except (OSError, ValueError, asyncio.TimeoutError):
+            return None
+        text = out.decode("utf-8", errors="replace")
+        unsupported = set()
+        for ev in self._events:
+            for line in text.splitlines():
+                if ev in line and "<not supported>" in line:
+                    unsupported.add(ev)
+                    break
+        return unsupported
 
     async def start(self):
         perf = shutil.which("perf")
@@ -559,17 +591,34 @@ class L3MpkiSampler:
         if not self._domains:
             print("mpki: WARNING no L3 domains detected under sysfs; skipping")
             return False
+        # Fail fast on unsupported events: otherwise misses silently parse as
+        # absent and MPKI reports a misleading 0.0 for the whole run.
+        unsupported = await self._probe_events(perf)
+        if unsupported:
+            fatal = unsupported & {self._events[0], self._events[-1]}
+            msg = (
+                f"mpki: WARNING kernel/PMU does not support: {sorted(unsupported)}. "
+                f"events tried: {','.join(self._events)}"
+            )
+            if fatal:
+                print(
+                    msg
+                    + " -- MPKI is NOT collectable on this host (try a newer kernel, "
+                    "or --mpki-events with events from `perf list`); disabling MPKI sampling"
+                )
+                return False
+            print(msg + " -- continuing without them (MPKI still valid)")
         interval_ms = int(self._interval_sec * 1000)
         print(
             f"mpki: {len(self._domains)} L3 domains, "
             f"perf interval {interval_ms}ms "
-            f"(events: {','.join(MPKI_EVENTS)})"
+            f"(events: {','.join(self._events)})"
         )
         for idx, cpulist in self._domains:
             cmd = [
                 perf, "stat", "-a", "-C", cpulist,
                 "-x", ",", "-I", str(interval_ms),
-                "-e", ",".join(MPKI_EVENTS),
+                "-e", ",".join(self._events),
             ]
             try:
                 proc = await asyncio.create_subprocess_exec(
@@ -618,7 +667,7 @@ class L3MpkiSampler:
                 # nearest numeric field before the event name)
                 for i in range(2, len(parts)):
                     name = parts[i].strip()
-                    if name not in MPKI_EVENTS:
+                    if name not in self._events:
                         continue
                     value = None
                     for j in range(i - 1, 0, -1):
@@ -634,11 +683,11 @@ class L3MpkiSampler:
                             self._latest[idx] = cur
                         cur = {}
                         cur_t = t
-                    key = {
-                        "LLC-load-misses": "misses",
-                        "LLC-loads": "loads",
-                        "instructions": "instr",
-                    }[name]
+                    key = (
+                        "misses" if name == self._events[0]
+                        else "instr" if name == self._events[-1]
+                        else "loads"
+                    )
                     cur[key] = value
         except Exception as exc:  # noqa: BLE001 -- best-effort reader
             print(f"mpki: WARNING domain {idx} reader stopped: {exc}")
@@ -703,7 +752,7 @@ async def list_sandboxes():
     return items
 
 
-async def main(out_dir, sample_interval=1.0, cgroup_name=None, cgroup_version="auto", cpu_range_spec=None, mpki=True):
+async def main(out_dir, sample_interval=1.0, cgroup_name=None, cgroup_version="auto", cpu_range_spec=None, mpki=True, mpki_events=None):
     os.makedirs(out_dir, exist_ok=True)
     metrics_path = os.path.join(out_dir, "metrics_1s.jsonl")
     events_path = os.path.join(out_dir, "sandbox_events.jsonl")
@@ -715,7 +764,9 @@ async def main(out_dir, sample_interval=1.0, cgroup_name=None, cgroup_version="a
 
     mpki_sampler = None
     if mpki:
-        mpki_sampler = L3MpkiSampler(sample_interval)
+        events = tuple(e.strip() for e in mpki_events.split(",")) if mpki_events else None
+        events = tuple(e for e in (events or ()) if e) or None
+        mpki_sampler = L3MpkiSampler(sample_interval, events=events)
         if not await mpki_sampler.start():
             mpki_sampler = None
 
@@ -1061,6 +1112,15 @@ def parse_args(argv):
             "degrades to a warning when perf/LLC events are unavailable)"
         ),
     )
+    parser.add_argument(
+        "--mpki-events", default=None,
+        help=(
+            "Comma-separated perf events, ordered: miss-event,aux-event,"
+            "instruction-event (default: LLC-load-misses,LLC-loads,instructions). "
+            "Use events from `perf list` when the defaults are unsupported on "
+            "this kernel/PMU (e.g. old kernel + new AMD family)"
+        ),
+    )
     return parser.parse_args(argv)
 
 
@@ -1075,5 +1135,6 @@ if __name__ == "__main__":
             cgroup_version=_args.cgroup_version,
             cpu_range_spec=_args.cpu_range,
             mpki=_args.mpki,
+            mpki_events=_args.mpki_events,
         )
     )
