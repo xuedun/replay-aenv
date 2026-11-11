@@ -18,10 +18,12 @@ Outputs:
   ├── mpki_summary.csv         # global L3 MPKI stats per metrics file (when collected)
   └── observability/
       ├── cgroup_cpu_mem_ratio01_repeat01.png
+      ├── mpki_ratio01_repeat01.png          # global L3 MPKI over time (when collected)
       └── cgroup_cpu_mem_ratio02_repeat01.png
 """
 import csv
 import json
+import math
 import os
 import re
 import sys
@@ -411,6 +413,7 @@ def extract_cgroup_metrics(metrics: list[dict]) -> dict:
     host_cpu_pct = []
     host_mem_used = []
     host_mem_cached = []
+    mpki_global = []
     elapsed = []
 
     # Accumulate per-sample interval_s into a monotonic elapsed axis.
@@ -441,6 +444,13 @@ def extract_cgroup_metrics(metrics: list[dict]) -> dict:
         host_cpu_pct.append(float(m.get("cpu_pct", 0)))
         host_mem_used.append(float(m.get("mem_used_gb", 0)))
         host_mem_cached.append(float(m.get("mem_cached_gb", 0)))
+        # Global instruction-weighted L3 MPKI (None when the sample carries
+        # no l3_* fields, e.g. perf warm-up or MPKI disabled).
+        l3_misses = m.get("l3_misses_s") or {}
+        l3_instr = m.get("l3_instr_s") or {}
+        m_sum = sum(v for v in l3_misses.values() if isinstance(v, (int, float)))
+        i_sum = sum(v for v in l3_instr.values() if isinstance(v, (int, float)))
+        mpki_global.append(m_sum / i_sum * 1000.0 if i_sum > 0 else None)
 
     return {
         "timestamps": timestamps,
@@ -454,6 +464,7 @@ def extract_cgroup_metrics(metrics: list[dict]) -> dict:
         "host_cpu_pct": host_cpu_pct,
         "host_mem_used": host_mem_used,
         "host_mem_cached": host_mem_cached,
+        "mpki_global": mpki_global,
     }
 
 
@@ -510,6 +521,43 @@ def plot_cgroup_metrics(
     print(f"  [plot] {output_path}")
 
 
+def plot_mpki_curve(
+    data: dict,
+    output_path: Path,
+    title: str = "",
+):
+    """Plot the global instruction-weighted L3 MPKI over time (one curve).
+
+    Uses the same elapsed axis as the cgroup CPU/mem plots and lives in the
+    same observability directory. None samples (perf warm-up / MPKI off)
+    become NaN and are simply skipped by the line.
+    """
+    elapsed = data["elapsed"]
+    values = [
+        float("nan") if v is None else float(v)
+        for v in data["mpki_global"]
+    ]
+    if not any(not math.isnan(v) for v in values):
+        return
+    fig, ax = plt.subplots(figsize=(14, 4.5))
+    ax.plot(
+        elapsed,
+        values,
+        color="#c084fc",
+        linewidth=1.2,
+        label="global L3 MPKI (instruction-weighted)",
+    )
+    ax.set_xlabel("Elapsed (s)")
+    ax.set_ylabel("L3 MPKI (misses / kilo instructions)")
+    ax.set_title(title or "Global L3 MPKI Over Time")
+    ax.grid(True, alpha=0.3)
+    ax.legend(loc="upper right", fontsize=9)
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=150, bbox_inches="tight")
+    plt.close()
+    print(f"  [plot] {output_path}")
+
+
 def write_cgroup_csv(data: dict, csv_path: Path):
     """Write cgroup metrics to CSV."""
     fields = [
@@ -517,6 +565,7 @@ def write_cgroup_csv(data: dict, csv_path: Path):
         "cgroup_cpu_cores", "cgroup_cpu_user_cores", "cgroup_cpu_sys_cores",
         "cgroup_mem_usage_gb", "cgroup_mem_rss_gb", "cgroup_mem_cache_gb",
         "host_cpu_pct", "host_mem_used_gb", "host_mem_cached_gb",
+        "l3_mpki_global",
     ]
     with open(csv_path, "w", newline="", encoding="utf-8-sig") as f:
         writer = csv.DictWriter(f, fieldnames=fields, extrasaction="ignore")
@@ -534,6 +583,11 @@ def write_cgroup_csv(data: dict, csv_path: Path):
                 "host_cpu_pct": data["host_cpu_pct"][i],
                 "host_mem_used_gb": data["host_mem_used"][i],
                 "host_mem_cached_gb": data["host_mem_cached"][i],
+                "l3_mpki_global": (
+                    round(data["mpki_global"][i], 3)
+                    if data["mpki_global"][i] is not None
+                    else ""
+                ),
             })
 
 
@@ -623,6 +677,8 @@ def process_observability(results_dir: Path, output_dir: Path, cpu_limit: int = 
         # Plot
         png_path = obs_dir / f"cgroup_cpu_mem_{label}.png"
         plot_cgroup_metrics(data, png_path, title=f"cgroup CPU/Mem ({label})", cpu_limit=cpu_limit)
+        mpki_png = obs_dir / f"mpki_{label}.png"
+        plot_mpki_curve(data, mpki_png, title=f"global L3 MPKI ({label})")
 
     if mpki_rows:
         mpki_path = output_dir / "mpki_summary.csv"
