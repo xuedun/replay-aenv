@@ -392,9 +392,12 @@ def read_cgroup_cpu(cpu_path, version="v1"):
                         if key == "usage_usec":
                             usage_ns = val * 1000
                         elif key == "user_usec":
-                            user_jiffies = val * 1000 // CLK_TCK
+                            # usec -> jiffies: seconds * CLK_TCK
+                            # (the old `val * 1000 // CLK_TCK` computed
+                            # ns/CLK_TCK, inflating user/sys by 1e5x on v2)
+                            user_jiffies = val * CLK_TCK // 1_000_000
                         elif key == "system_usec":
-                            system_jiffies = val * 1000 // CLK_TCK
+                            system_jiffies = val * CLK_TCK // 1_000_000
         except (OSError, ValueError, IndexError):
             pass
     else:
