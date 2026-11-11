@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 try:  # shared helper (package layout or direct script execution)
-    from . import numa_binding
+    from . import ccl_binding
 except ImportError:
-    import numa_binding
+    import ccl_binding
 
 import argparse
 import asyncio
@@ -133,9 +133,9 @@ class ReplayOptions:
     instance_overlay_dir: Path | None = None
     command_transport: str = "aenv-proxy"
     direct_envd_port: int = DEFAULT_ENVD_PORT
-    numa_bind: bool = False
-    numa_index: int = 0
-    numa_total: int = 1
+    ccl_bind: bool = False
+    ccl_granularity: str = "auto"
+    ccl_index: int = 0
 
 
 @dataclass(slots=True, frozen=True)
@@ -1052,26 +1052,15 @@ class ReplayRunner:
             f"Created sandbox {self.sandbox_id} create_attempts={create_attempts}",
         )
 
-        if getattr(self.options, "numa_bind", False) and self.sandbox_id:
-            numa_report = await numa_binding.bind_sandbox_to_numa(
+        if getattr(self.options, "ccl_bind", False) and self.sandbox_id:
+            ccl_report = await ccl_binding.bind_sandbox_to_ccl(
                 self.sandbox_id,
-                index=getattr(self.options, "numa_index", 0),
-                total=max(1, getattr(self.options, "numa_total", 1)),
+                index=getattr(self.options, "ccl_index", 0),
+                granularity=getattr(self.options, "ccl_granularity", "auto"),
             )
             self._event(
-                "info" if numa_report.get("applied") else "warn",
-                "NUMA bind sandbox={sid} vm_index={idx}/{total} "
-                "node={node} cpulist={cpulist} pid={pid} "
-                "applied={applied} reason={reason}".format(
-                    sid=self.sandbox_id,
-                    idx=numa_report.get("index"),
-                    total=numa_report.get("total"),
-                    node=numa_report.get("node"),
-                    cpulist=numa_report.get("cpulist"),
-                    pid=numa_report.get("pid", ""),
-                    applied=numa_report.get("applied"),
-                    reason=numa_report.get("reason", ""),
-                ),
+                "info" if ccl_report.get("verified") else "warn",
+                ccl_binding.format_report(ccl_report),
             )
 
     async def _fetch_runtime_route(self) -> RuntimeRoute:
@@ -2042,7 +2031,8 @@ def replay_options_from_args(args: argparse.Namespace) -> ReplayOptions:
         ready_probe_timeout_sec=args.ready_probe_timeout_sec,
         command_transport=args.command_transport,
         direct_envd_port=args.direct_envd_port,
-        numa_bind=getattr(args, "numa_bind", False),
+        ccl_bind=getattr(args, "ccl_bind", False),
+        ccl_granularity=getattr(args, "ccl_granularity", "auto"),
         instance_overlay_dir=(
             None
             if args.skip_instance_patch
@@ -2324,7 +2314,9 @@ async def run_batch(args: argparse.Namespace) -> int:
         f"control_plane_inflight_cap={control_plane_config.inflight_cap} "
         f"launch_interval_sec={args.launch_interval_sec:.3f} "
         f"launch_batch_size={getattr(args, 'launch_batch_size', 1)} "
-        f"numa_bind={getattr(args, 'numa_bind', False)} "
+        f"ccl_bind={getattr(args, 'ccl_bind', False)} "
+        f"ccl_granularity={getattr(args, 'ccl_granularity', 'auto')} "
+        f"{(ccl_binding.topology_summary() + ' ') if getattr(args, 'ccl_bind', False) else ''}"
         f"template={args.template if mixed_config is None else 'mixed'} "
         f"trajectory_source={Path(args.trajectory_dir).expanduser().resolve()} "
         f"output_dir={batch_dir}",
@@ -2360,8 +2352,7 @@ async def run_batch(args: argparse.Namespace) -> int:
                     replace(
                         options,
                         template=scheduled.template or options.template,
-                        numa_index=index,
-                        numa_total=len(scheduled_trajectories),
+                        ccl_index=index,
                     ),
                     console_output=False,
                     control_plane_scheduler=control_plane_scheduler,
@@ -2842,12 +2833,22 @@ def add_batch_runtime_arguments(parser: argparse.ArgumentParser) -> None:
         ),
     )
     parser.add_argument(
-        "--numa-bind",
+        "--ccl-bind",
         action="store_true",
         default=False,
         help=(
-            "Bind each sandbox's firecracker process to a NUMA node: VMs are "
-            "split into contiguous equal groups (four on a four-node host)"
+            "Bind each sandbox's firecracker (every thread) to one silicon L3 "
+            "domain (AMD CCD / Kunpeng CL), round-robin by VM index. "
+            "Needs root on the AgentENV host"
+        ),
+    )
+    parser.add_argument(
+        "--ccl-granularity",
+        default="auto",
+        choices=["auto", "l3", "numa", "socket"],
+        help=(
+            "Domain level for --ccl-bind: auto = L3 domains when sysfs exposes "
+            "them, else NUMA, else socket (default: auto)"
         ),
     )
     parser.add_argument(

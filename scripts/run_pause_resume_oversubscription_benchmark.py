@@ -422,10 +422,19 @@ def build_parser() -> argparse.ArgumentParser:
         help="Number of VMs launched per batch with no pacing inside the batch (default: 1)",
     )
     parser.add_argument(
-        "--numa-bind",
+        "--ccl-bind",
         action="store_true",
         default=False,
-        help="Bind sandbox firecracker processes to NUMA nodes (VMs split evenly, 4 groups on a 4-node host)",
+        help=(
+            "Bind each sandbox's firecracker (every thread) to one silicon L3 "
+            "domain (AMD CCD / Kunpeng CL), round-robin by VM index; needs root"
+        ),
+    )
+    parser.add_argument(
+        "--ccl-granularity",
+        default="auto",
+        choices=["auto", "l3", "numa", "socket"],
+        help="Domain level for --ccl-bind (default: auto = L3, else NUMA, else socket)",
     )
     parser.add_argument("--pause-duration-sec", type=nonnegative_float, default=0.0)
     parser.add_argument(
@@ -832,8 +841,9 @@ def command_for_trial(
         "--output-dir",
         str(output_dir),
     ]
-    if getattr(args, "numa_bind", False):
-        command.append("--numa-bind")
+    if getattr(args, "ccl_bind", False):
+        command.append("--ccl-bind")
+        command.extend(["--ccl-granularity", str(getattr(args, "ccl_granularity", "auto"))])
     if args.stop_on_error:
         command.append("--stop-on-error")
     command.append("--keep-sandbox-on-failure")
