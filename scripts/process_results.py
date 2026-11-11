@@ -13,7 +13,7 @@ Outputs:
   │   ├── vm_0001.csv          # per-action: wait, exec, pause, resume
   │   ├── vm_0002.csv
   │   └── ...
-  ├── vm_summary.csv           # per-VM averages
+  ├── vm_summary.csv           # per-VM averages + wall_sec + trailing P50 row
   ├── case_summary.csv         # per-case wall/exec stats (avg/P50/P95/P99, real VMs only)
   ├── mpki_summary.csv         # global L3 MPKI stats per metrics file (when collected)
   └── observability/
@@ -120,6 +120,7 @@ def process_vm_timings(results_dir: Path, output_dir: Path):
 
     summary_rows = []
     case_rows = []
+    vm_wall_picks = []  # (is_noise, wall_sec_or_None, summary_row_ref)
     noise_vm_count = 0
     for idx, result_path in enumerate(result_files, 1):
         try:
@@ -176,11 +177,17 @@ def process_vm_timings(results_dir: Path, output_dir: Path):
                 "succeeded": bool(succeeded),
             })
 
+        wall_sec = (
+            float(result["elapsed_sec"])
+            if result.get("elapsed_sec") is not None
+            else None
+        )
         summary_rows.append({
             "vm": vm_name,
             "label": vm_label,
             "scenario": scenario,
             "sandbox_id": sandbox_id,
+            "wall_sec": round(wall_sec, 4) if wall_sec is not None else "",
             "actions": n,
             "avg_wait_sec": round(avg_wait, 4),
             "avg_exec_sec": round(avg_exec, 4),
@@ -193,10 +200,32 @@ def process_vm_timings(results_dir: Path, output_dir: Path):
             "total_resume_sec": round(sum(s["resume_sec"] for s in steps), 4),
             "succeeded": succeeded,
         })
+        vm_wall_picks.append((is_noise, wall_sec, summary_rows[-1]))
+
+    # P50 row (last line): the real (noise-excluded) VM whose wall time sits
+    # at the median of all real VMs' walls; its whole per-VM row is copied so
+    # vm_summary ends with "a typical run". Ties resolve to the lower wall.
+    real_picks = [
+        (w, row) for is_noise, w, row in vm_wall_picks
+        if not is_noise and w is not None
+    ]
+    if real_picks:
+        p50_value = _median([w for w, _row in real_picks])
+        _chosen_wall, chosen_row = min(
+            real_picks, key=lambda wr: (abs(wr[0] - p50_value), wr[0])
+        )
+        p50_row = dict(chosen_row)
+        p50_row["vm"] = "P50"
+        p50_row["label"] = f"P50(source={chosen_row['label']})"
+        summary_rows.append(p50_row)
+        print(
+            f"[vm_timings] P50 row: vm={chosen_row['vm']} "
+            f"wall={chosen_row['wall_sec']}s (median of {len(real_picks)} real VMs)"
+        )
 
     summary_path = output_dir / "vm_summary.csv"
     summary_fields = [
-        "vm", "label", "scenario", "sandbox_id", "actions",
+        "vm", "label", "scenario", "sandbox_id", "wall_sec", "actions",
         "avg_wait_sec", "avg_exec_sec", "avg_pause_sec", "avg_resume_sec",
         "avg_interaction_sec",
         "total_wait_sec", "total_exec_sec", "total_pause_sec", "total_resume_sec",
