@@ -2,10 +2,10 @@
 """Process benchmark results: per-VM timing CSV + cgroup CPU/mem plots.
 
 Usage:
-  python3 process_results.py <results_dir> <output_dir>
+  python3 process_results.py <results_dir> [output_dir]
 
   results_dir  - runs/pause-resume-oversub-N8-xxx/ (from benchmark driver)
-  output_dir   - where to write CSVs and PNGs
+  output_dir   - where to write CSVs and PNGs; omitted -> <results_dir>/processed
 
 Outputs:
   output_dir/
@@ -600,13 +600,6 @@ def process_observability(results_dir: Path, output_dir: Path, cpu_limit: int = 
 
 
 def main():
-    if len(sys.argv) < 3:
-        print(f"Usage: {sys.argv[0]} <results_dir> <output_dir> [--cpu-limit N]")
-        print(f"  results_dir  - runs/pause-resume-oversub-N8-xxx/")
-        print(f"  output_dir   - where to write CSVs and PNGs")
-        print(f"  --cpu-limit  - total CPU cores for reference line (default: 384)")
-        return 1
-
     args = sys.argv[1:]
     cpu_limit = 384
     if "--cpu-limit" in args:
@@ -619,8 +612,20 @@ def main():
                 print(f"ERROR: --cpu-limit must be an integer, got: {args[idx + 1]}")
                 return 1
 
+    if not args:
+        print(f"Usage: {sys.argv[0]} <results_dir> [output_dir] [--cpu-limit N]")
+        print(f"  results_dir  - runs/pause-resume-oversub-N8-xxx/")
+        print(f"  output_dir   - where to write CSVs and PNGs (default: <results_dir>/processed)")
+        print(f"  --cpu-limit  - total CPU cores for reference line (default: 384)")
+        return 1
+
     results_dir = Path(args[0]).resolve()
-    output_dir = Path(args[1]).resolve()
+    if len(args) > 1 and str(args[1]).strip():
+        output_dir = Path(args[1]).resolve()
+    else:
+        # No output_dir given: create one inside the results dir so the
+        # artifacts travel with the run.
+        output_dir = results_dir / "processed"
 
     if not results_dir.is_dir():
         print(f"ERROR: results dir not found: {results_dir}")
