@@ -167,6 +167,9 @@ def process_vm_timings(results_dir: Path, output_dir: Path):
                     else None
                 ),
                 "total_exec_sec": sum(s["exec_sec"] for s in steps),
+                # wait semantics per scenario: COW = measured delay sleep
+                # (includes scheduler overshoot), pause-resume = paused_sec.
+                "total_wait_sec": sum(s["wait_sec"] for s in steps),
                 "actions": len(steps),
                 "succeeded": bool(succeeded),
             })
@@ -281,6 +284,11 @@ def write_case_summary(
         runs = cases[case]
         wall = [r["wall_sec"] for r in runs if r["wall_sec"] is not None]
         execs = [r["total_exec_sec"] for r in runs]
+        waits = [r["total_wait_sec"] for r in runs]
+        # Estimated run time without create/teardown/inter-step gaps:
+        # per-VM exec + wait. Lower bound vs wall (wall also carries
+        # sandbox_create_sec + inter-step gaps + delete_cleanup_sec).
+        ests = [e + w for e, w in zip(execs, waits)]
         n = len(runs)
         succeeded = sum(1 for r in runs if r["succeeded"])
         summary_rows.append({
@@ -301,6 +309,16 @@ def write_case_summary(
             "exec_p50_sec": round(_percentile(execs, 50), 4) if execs else "",
             "exec_p95_sec": round(_percentile(execs, 95), 4) if execs else "",
             "exec_p99_sec": round(_percentile(execs, 99), 4) if execs else "",
+            # wait totals (same stat set as exec)
+            "avg_total_wait_sec": round(sum(waits) / n, 4) if n else 0,
+            "wait_p50_sec": round(_percentile(waits, 50), 4) if waits else "",
+            "wait_p95_sec": round(_percentile(waits, 95), 4) if waits else "",
+            "wait_p99_sec": round(_percentile(waits, 99), 4) if waits else "",
+            # exec + wait: the startup-free run-time estimate
+            "exec_wait_avg_sec": round(sum(ests) / n, 4) if n else 0,
+            "exec_wait_p50_sec": round(_percentile(ests, 50), 4) if ests else "",
+            "exec_wait_p95_sec": round(_percentile(ests, 95), 4) if ests else "",
+            "exec_wait_p99_sec": round(_percentile(ests, 99), 4) if ests else "",
             "avg_actions": round(sum(r["actions"] for r in runs) / n, 2) if n else 0,
         })
 
@@ -308,6 +326,8 @@ def write_case_summary(
     if case_rows:
         all_walls = [r["wall_sec"] for r in case_rows if r["wall_sec"] is not None]
         all_execs = [r["total_exec_sec"] for r in case_rows]
+        all_waits = [r["total_wait_sec"] for r in case_rows]
+        all_ests = [e + w for e, w in zip(all_execs, all_waits)]
         n_all = len(case_rows)
         ok_all = sum(1 for r in case_rows if r["succeeded"])
         summary_rows.append({
@@ -326,6 +346,14 @@ def write_case_summary(
             "exec_p50_sec": round(_percentile(all_execs, 50), 4) if all_execs else "",
             "exec_p95_sec": round(_percentile(all_execs, 95), 4) if all_execs else "",
             "exec_p99_sec": round(_percentile(all_execs, 99), 4) if all_execs else "",
+            "avg_total_wait_sec": round(sum(all_waits) / n_all, 4) if n_all else 0,
+            "wait_p50_sec": round(_percentile(all_waits, 50), 4) if all_waits else "",
+            "wait_p95_sec": round(_percentile(all_waits, 95), 4) if all_waits else "",
+            "wait_p99_sec": round(_percentile(all_waits, 99), 4) if all_waits else "",
+            "exec_wait_avg_sec": round(sum(all_ests) / n_all, 4) if n_all else 0,
+            "exec_wait_p50_sec": round(_percentile(all_ests, 50), 4) if all_ests else "",
+            "exec_wait_p95_sec": round(_percentile(all_ests, 95), 4) if all_ests else "",
+            "exec_wait_p99_sec": round(_percentile(all_ests, 99), 4) if all_ests else "",
             "avg_actions": round(sum(r["actions"] for r in case_rows) / n_all, 2) if n_all else 0,
         })
 
@@ -335,6 +363,8 @@ def write_case_summary(
         "avg_wall_sec", "median_wall_sec", "wall_p95_sec", "wall_p99_sec",
         "min_wall_sec", "max_wall_sec",
         "avg_total_exec_sec", "exec_p50_sec", "exec_p95_sec", "exec_p99_sec",
+        "avg_total_wait_sec", "wait_p50_sec", "wait_p95_sec", "wait_p99_sec",
+        "exec_wait_avg_sec", "exec_wait_p50_sec", "exec_wait_p95_sec", "exec_wait_p99_sec",
         "avg_actions",
     ]
     with open(summary_path, "w", newline="", encoding="utf-8-sig") as f:
@@ -349,7 +379,9 @@ def write_case_summary(
             f"  {tag}={row['case']} vms={row['vms']} ok={row['succeeded']}/{row['vms']} "
             f"wall avg={row['avg_wall_sec']}s p50={row['median_wall_sec']}s "
             f"p95={row['wall_p95_sec']}s p99={row['wall_p99_sec']}s "
-            f"exec avg={row['avg_total_exec_sec']}s p95={row['exec_p95_sec']}s"
+            f"exec avg={row['avg_total_exec_sec']}s p95={row['exec_p95_sec']}s "
+            f"wait avg={row['avg_total_wait_sec']}s "
+            f"exec+wait p50={row['exec_wait_p50_sec']}s p95={row['exec_wait_p95_sec']}s"
         )
 
 
