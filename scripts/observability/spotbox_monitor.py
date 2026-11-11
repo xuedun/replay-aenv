@@ -543,13 +543,31 @@ class L3MpkiSampler:
     """
 
     def __init__(self, interval_sec=1.0, events=None):
-        # Event roles by position: [0]=misses, middle=loads (aux), [-1]=instructions.
-        # Override (e.g. arch-specific raw events) via --mpki-events, ordered the
-        # same way: miss-event,aux-event,instruction-event.
-        self._events = tuple(events) if events else MPKI_EVENTS
-        if len(self._events) < 2:
-            print("mpki: WARNING need at least miss,instruction events; skipping")
+        # Event roles by slot position: [0]=misses, middle=loads (aux), [-1]=instructions.
+        # A slot may be a "+"-joined list of events whose values are SUMMED into
+        # that role (e.g. "dram_near+dram_far" as the miss slot). Override via
+        # --mpki-events, ordered: miss-slot,aux-slot,instruction-slot.
+        slots = [
+            [name.strip() for name in slot.split("+") if name.strip()]
+            for slot in (events or MPKI_EVENTS)
+        ]
+        slots = [s for s in slots if s]
+        if len(slots) < 2:
+            print("mpki: WARNING need at least miss,instruction event slots; skipping")
+            self._slots = []
             self._events = ()
+            self._role_of = {}
+        else:
+            self._slots = slots
+            self._events = tuple(name for s in slots for name in s)
+            self._role_of = {}
+            for name in slots[0]:
+                self._role_of[name] = "misses"
+            for name in slots[-1]:
+                self._role_of[name] = "instr"
+            for s in slots[1:-1]:
+                for name in s:
+                    self._role_of[name] = "loads"
         self._interval_sec = max(0.25, float(interval_sec))
         self._procs = {}
         self._tasks = {}
@@ -595,7 +613,11 @@ class L3MpkiSampler:
         # absent and MPKI reports a misleading 0.0 for the whole run.
         unsupported = await self._probe_events(perf)
         if unsupported:
-            fatal = unsupported & {self._events[0], self._events[-1]}
+            fatal = {
+                name
+                for name in unsupported
+                if self._role_of.get(name) in ("misses", "instr")
+            }
             msg = (
                 f"mpki: WARNING kernel/PMU does not support: {sorted(unsupported)}. "
                 f"events tried: {','.join(self._events)}"
@@ -667,7 +689,7 @@ class L3MpkiSampler:
                 # nearest numeric field before the event name)
                 for i in range(2, len(parts)):
                     name = parts[i].strip()
-                    if name not in self._events:
+                    if name not in self._role_of:
                         continue
                     value = None
                     for j in range(i - 1, 0, -1):
@@ -683,12 +705,8 @@ class L3MpkiSampler:
                             self._latest[idx] = cur
                         cur = {}
                         cur_t = t
-                    key = (
-                        "misses" if name == self._events[0]
-                        else "instr" if name == self._events[-1]
-                        else "loads"
-                    )
-                    cur[key] = value
+                    key = self._role_of[name]
+                    cur[key] = cur.get(key, 0.0) + value
         except Exception as exc:  # noqa: BLE001 -- best-effort reader
             print(f"mpki: WARNING domain {idx} reader stopped: {exc}")
         finally:
@@ -764,8 +782,11 @@ async def main(out_dir, sample_interval=1.0, cgroup_name=None, cgroup_version="a
 
     mpki_sampler = None
     if mpki:
-        events = tuple(e.strip() for e in mpki_events.split(",")) if mpki_events else None
-        events = tuple(e for e in (events or ()) if e) or None
+        events = (
+            tuple(s.strip() for s in mpki_events.split(",") if s.strip())
+            if mpki_events
+            else None
+        )
         mpki_sampler = L3MpkiSampler(sample_interval, events=events)
         if not await mpki_sampler.start():
             mpki_sampler = None
@@ -1115,10 +1136,13 @@ def parse_args(argv):
     parser.add_argument(
         "--mpki-events", default=None,
         help=(
-            "Comma-separated perf events, ordered: miss-event,aux-event,"
-            "instruction-event (default: LLC-load-misses,LLC-loads,instructions). "
-            "Use events from `perf list` when the defaults are unsupported on "
-            "this kernel/PMU (e.g. old kernel + new AMD family)"
+            "Comma-separated perf event slots, ordered: miss-slot,aux-slot,"
+            "instruction-slot (default: LLC-load-misses,LLC-loads,instructions). "
+            "A slot may join several events with '+' whose values are summed "
+            "(e.g. 'ls_dmnd_fills_from_sys.dram_io_near+ls_dmnd_fills_from_sys."
+            "dram_io_far,instructions' = DRAM-fill MPKI, the L3-capacity-"
+            "sensitive signal on AMD). Use `perf list` when the defaults are "
+            "unsupported on this kernel/PMU"
         ),
     )
     return parser.parse_args(argv)
