@@ -322,44 +322,34 @@ def write_case_summary(
             "avg_actions": round(sum(r["actions"] for r in runs) / n, 2) if n else 0,
         })
 
-    # Aggregate row across ALL cases (pooled per-VM samples, appended last).
-    if case_rows:
-        all_walls = [r["wall_sec"] for r in case_rows if r["wall_sec"] is not None]
-        all_execs = [r["total_exec_sec"] for r in case_rows]
-        all_waits = [r["total_wait_sec"] for r in case_rows]
-        all_ests = [e + w for e, w in zip(all_execs, all_waits)]
-        n_all = len(case_rows)
-        ok_all = sum(1 for r in case_rows if r["succeeded"])
-        summary_rows.append({
-            "case": "ALL",
-            "scenario": case_rows[0]["scenario"],
-            "vms": n_all,
-            "succeeded": ok_all,
-            "succeeded_ratio": round(ok_all / n_all, 4) if n_all else 0,
-            "avg_wall_sec": round(sum(all_walls) / len(all_walls), 4) if all_walls else "",
-            "median_wall_sec": round(_median(all_walls), 4) if all_walls else "",
-            "wall_p95_sec": round(_percentile(all_walls, 95), 4) if all_walls else "",
-            "wall_p99_sec": round(_percentile(all_walls, 99), 4) if all_walls else "",
-            "min_wall_sec": round(min(all_walls), 4) if all_walls else "",
-            "max_wall_sec": round(max(all_walls), 4) if all_walls else "",
-            "avg_total_exec_sec": round(sum(all_execs) / n_all, 4) if n_all else 0,
-            "exec_p50_sec": round(_percentile(all_execs, 50), 4) if all_execs else "",
-            "exec_p95_sec": round(_percentile(all_execs, 95), 4) if all_execs else "",
-            "exec_p99_sec": round(_percentile(all_execs, 99), 4) if all_execs else "",
-            "avg_total_wait_sec": round(sum(all_waits) / n_all, 4) if n_all else 0,
-            "wait_p50_sec": round(_percentile(all_waits, 50), 4) if all_waits else "",
-            "wait_p95_sec": round(_percentile(all_waits, 95), 4) if all_waits else "",
-            "wait_p99_sec": round(_percentile(all_waits, 99), 4) if all_waits else "",
-            "exec_wait_avg_sec": round(sum(all_ests) / n_all, 4) if n_all else 0,
-            "exec_wait_p50_sec": round(_percentile(all_ests, 50), 4) if all_ests else "",
-            "exec_wait_p95_sec": round(_percentile(all_ests, 95), 4) if all_ests else "",
-            "exec_wait_p99_sec": round(_percentile(all_ests, 99), 4) if all_ests else "",
-            "avg_actions": round(sum(r["actions"] for r in case_rows) / n_all, 2) if n_all else 0,
-        })
+    # ALL row: the P50 TRAJECTORY, not pooled percentiles. Cases are ranked
+    # by their own wall P50; the case whose P50 sits at the median of the
+    # case-level P50s becomes the representative -- the ALL row carries that
+    # trajectory's full stat set (vms, wall/exec/wait/exec_wait), so it reads
+    # as "a typical trajectory" instead of a blend across different cases.
+    if summary_rows:
+        candidates = [
+            (row, row["median_wall_sec"])
+            for row in summary_rows
+            if row["median_wall_sec"] not in ("", None)
+        ]
+        if candidates:
+            p50_values = sorted(v for _r, v in candidates)
+            p50_median = _median(p50_values)
+            chosen_row, _ = min(
+                candidates,
+                key=lambda c: (abs(c[1] - p50_median), c[1]),
+            )
+        else:
+            chosen_row = summary_rows[0]
+        all_row = dict(chosen_row)
+        all_row["case"] = "ALL"
+        all_row["source_case"] = chosen_row["case"]
+        summary_rows.append(all_row)
 
     summary_path = output_dir / "case_summary.csv"
     fields = [
-        "case", "scenario", "vms", "succeeded", "succeeded_ratio",
+        "case", "source_case", "scenario", "vms", "succeeded", "succeeded_ratio",
         "avg_wall_sec", "median_wall_sec", "wall_p95_sec", "wall_p99_sec",
         "min_wall_sec", "max_wall_sec",
         "avg_total_exec_sec", "exec_p50_sec", "exec_p95_sec", "exec_p99_sec",
@@ -375,8 +365,9 @@ def write_case_summary(
     print(f"[case_summary] Real VMs per case: {summary_path}")
     for row in summary_rows:
         tag = "ALL" if row["case"] == "ALL" else "case"
+        src = f" (source={row['source_case']})" if row.get("source_case") else ""
         print(
-            f"  {tag}={row['case']} vms={row['vms']} ok={row['succeeded']}/{row['vms']} "
+            f"  {tag}={row['case']}{src} vms={row['vms']} ok={row['succeeded']}/{row['vms']} "
             f"wall avg={row['avg_wall_sec']}s p50={row['median_wall_sec']}s "
             f"p95={row['wall_p95_sec']}s p99={row['wall_p99_sec']}s "
             f"exec avg={row['avg_total_exec_sec']}s p95={row['exec_p95_sec']}s "
