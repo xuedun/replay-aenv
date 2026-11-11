@@ -856,8 +856,6 @@ def command_for_trial(
     if getattr(args, "ccl_bind", False):
         command.append("--ccl-bind")
         command.extend(["--ccl-granularity", str(getattr(args, "ccl_granularity", "auto"))])
-    if getattr(args, "mpki_events", None):
-        command.extend(["--mpki-events", str(args.mpki_events)])
     if args.stop_on_error:
         command.append("--stop-on-error")
     if args.command_timeout_continue:
@@ -975,6 +973,8 @@ def start_observability(
             command.append("")  # empty cgroup_name placeholder
         command.append(getattr(args, "cgroup_version", "auto"))
         command.append(args.cpu_range)
+    if getattr(args, "mpki_events", None):
+        command.extend(["--mpki-events", str(args.mpki_events)])
     log_handle = log_path.open("w", encoding="utf-8")
     try:
         process = subprocess.Popen(
