@@ -106,6 +106,7 @@ TRIAL_COLUMNS = [
     "total",
     "succeeded",
     "failed",
+    "early_stopped",
     "running_peak",
     "running_granted",
     "run_queue_wait_avg_sec",
@@ -432,6 +433,16 @@ def build_parser() -> argparse.ArgumentParser:
             "Comma-separated perf events for the observability monitor's "
             "per-L3-domain MPKI sampling, ordered: miss-event,aux-event,"
             "instruction-event (default: LLC-load-misses,LLC-loads,instructions)"
+        ),
+    )
+    parser.add_argument(
+        "--stop-after-completed",
+        type=positive_int,
+        default=None,
+        help=(
+            "Early stop the trial once N real VM replays completed "
+            "successfully: in-flight replays are cancelled and their "
+            "sandboxes killed (default: disabled)"
         ),
     )
     parser.add_argument(
@@ -856,6 +867,8 @@ def command_for_trial(
     if getattr(args, "ccl_bind", False):
         command.append("--ccl-bind")
         command.extend(["--ccl-granularity", str(getattr(args, "ccl_granularity", "auto"))])
+    if getattr(args, "stop_after_completed", None):
+        command.extend(["--stop-after-completed", str(args.stop_after_completed)])
     if args.stop_on_error:
         command.append("--stop-on-error")
     if args.command_timeout_continue:
@@ -1290,6 +1303,8 @@ def trial_from_summary(
         total = int(summary.get("total", 0))
         succeeded = int(summary.get("succeeded", 0))
         failed = int(summary.get("failed", 0))
+        early_stopped = bool(summary.get("early_stopped"))
+        requested_stop = int(summary.get("stop_after_completed") or 0)
         elapsed = float(summary["elapsed_sec"])
         running = summary.get("running_slots") or {}
         control = summary.get("control_plane") or {}
@@ -1304,6 +1319,7 @@ def trial_from_summary(
                 "total": total,
                 "succeeded": succeeded,
                 "failed": failed,
+                "early_stopped": early_stopped,
                 "running_peak": running.get("peak_active"),
                 "running_granted": running.get("granted"),
                 "run_queue_wait_avg_sec": running.get("average_queue_wait_sec"),
@@ -1313,9 +1329,20 @@ def trial_from_summary(
                 "completed_at": summary.get("completed_at"),
             }
         )
+        if early_stopped:
+            # Early-stop trials are valid when the requested number of
+            # successful replays was reached; totals are expected to be
+            # below target_count. throughput_tasks_per_sec is NOT
+            # comparable with full runs (shorter elapsed window).
+            completeness = (
+                requested_stop > 0
+                and succeeded >= requested_stop
+                and failed == 0
+            )
+        else:
+            completeness = total == target_count and succeeded == target_count
         trial["valid"] = (
-            total == target_count
-            and succeeded == target_count
+            completeness
             and failed == 0
             and running.get("maximum") == trial_concurrency
             and int(running.get("peak_active") or 0) <= trial_concurrency

@@ -2456,13 +2456,20 @@ async def run_batch(args: argparse.Namespace) -> int:
     noise_failed = 0
     stop_event = asyncio.Event()
 
+    # Early stop: once N real VM replays completed successfully, stop
+    # launching new VMs, cancel in-flight replays (their sandboxes are
+    # killed by the runner's finally-cleanup) and finish the batch.
+    stop_after_completed = getattr(args, "stop_after_completed", None)
+    completed_reals = 0
+    early_stop_event = asyncio.Event()
+
     # Per-rollout coordination objects
     round_events = [asyncio.Event() for _ in range(num_rollouts)]
     round_counters = [[0] for _ in range(num_rollouts)]
     round_locks = [asyncio.Lock() for _ in range(num_rollouts)]
 
     async def worker(worker_idx: int) -> None:
-        nonlocal noise_started
+        nonlocal noise_started, completed_reals
         scheduled = scheduled_trajectories[worker_idx]
         stem = slugify(scheduled.path.name.rsplit(".", 1)[0])
         slot_idx = worker_idx % n_cases
@@ -2470,11 +2477,40 @@ async def run_batch(args: argparse.Namespace) -> int:
         slot_dir = batch_dir / f"{slot_idx:04d}-{stem}"
 
         for rollout_idx in range(num_rollouts):
+            if early_stop_event.is_set():
+                break  # early-stop: no new rollout
             # Phase 1: Run real VM
             real_dir = slot_dir / f"rollout-{rollout_idx:03d}-real-{sub_idx:03d}"
             try:
                 result = await run_one(worker_idx, scheduled, real_dir, rollout_idx)
                 items_by_index[worker_idx] = result
+                if stop_after_completed and result.get("succeeded"):
+                    completed_reals += 1
+                    if (
+                        completed_reals >= stop_after_completed
+                        and not early_stop_event.is_set()
+                    ):
+                        early_stop_event.set()
+                        print(
+                            f"[early-stop] {completed_reals} real VMs completed "
+                            f"(target {stop_after_completed}); stopping new launches "
+                            "and cancelling in-flight replays",
+                            flush=True,
+                        )
+                        await write_job_event(
+                            "info",
+                            f"[early-stop] completed real VMs reached "
+                            f"{stop_after_completed}; stopping batch early",
+                        )
+            except asyncio.CancelledError:
+                # Early stop cancels in-flight replays; ReplayRunner.run()'s
+                # finally already killed the sandbox through cleanup_slot.
+                # Drop the incomplete result dir so downstream summaries
+                # only carry completed replays.
+                if early_stop_event.is_set():
+                    import shutil
+                    shutil.rmtree(real_dir, ignore_errors=True)
+                raise
             except Exception as exc:
                 items_by_index[worker_idx] = {
                     "index": worker_idx,
@@ -2499,8 +2535,8 @@ async def run_batch(args: argparse.Namespace) -> int:
             if noise_fill:
                 noise_seq = 0
                 while not round_events[rollout_idx].is_set():
-                    # Check if experiment is over (last rollout done)
-                    if stop_event.is_set():
+                    # Check if experiment is over (last rollout done / early stop)
+                    if stop_event.is_set() or early_stop_event.is_set():
                         break  # don't start new noise VM
                     import random as _random
                     noise_traj = _random.choice(scheduled_trajectories)
@@ -2526,14 +2562,27 @@ async def run_batch(args: argparse.Namespace) -> int:
                     except Exception:
                         pass  # noise VM failure is non-fatal
             else:
-                await round_events[rollout_idx].wait()
+                barrier_wait = asyncio.create_task(round_events[rollout_idx].wait())
+                early_wait = asyncio.create_task(early_stop_event.wait())
+                await asyncio.wait(
+                    {barrier_wait, early_wait},
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                for task in (barrier_wait, early_wait):
+                    if not task.done():
+                        task.cancel()
 
     # ── Create and run workers ──
     workers = [asyncio.create_task(worker(i)) for i in range(worker_count)]
 
     # Wait until the last rollout's last real VM finishes (stop_event is set
-    # by the last worker) or all workers finish naturally.
-    await stop_event.wait()
+    # by the last worker), all workers finish naturally, or early stop fires.
+    stop_wait = asyncio.create_task(stop_event.wait())
+    early_wait = asyncio.create_task(early_stop_event.wait())
+    await asyncio.wait({stop_wait, early_wait}, return_when=asyncio.FIRST_COMPLETED)
+    for task in (stop_wait, early_wait):
+        if not task.done():
+            task.cancel()
 
     # ── Stop logic: cancel workers still in noise VMs ──
     # Workers between noise VMs already broke via stop_event check.
@@ -2555,7 +2604,13 @@ async def run_batch(args: argparse.Namespace) -> int:
     await running_slot_scheduler.close()
 
     if any(item is None for item in items_by_index):
-        raise RuntimeError("Batch worker finished without producing every result")
+        if not early_stop_event.is_set():
+            raise RuntimeError("Batch worker finished without producing every result")
+        print(
+            f"[early-stop] {items_by_index.count(None)} cancelled in-flight "
+            "replays discarded",
+            flush=True,
+        )
     items = [item for item in items_by_index if item is not None]
     succeeded = sum(1 for item in items if item["succeeded"])
     workload_summaries = []
@@ -2618,6 +2673,8 @@ async def run_batch(args: argparse.Namespace) -> int:
         "rollout": num_rollouts,
         "rollout_end_times": rollout_end_times,
         "noise_fill": noise_fill,
+        "early_stopped": early_stop_event.is_set(),
+        "stop_after_completed": stop_after_completed,
         "create": {
             "admission": "running_slots",
             "retry_on_timeout": False,
@@ -2844,6 +2901,16 @@ def add_batch_runtime_arguments(parser: argparse.ArgumentParser) -> None:
         help=(
             "Number of VMs launched per batch with no pacing inside the batch; "
             "launch-interval-sec applies between batches (default: 1)"
+        ),
+    )
+    parser.add_argument(
+        "--stop-after-completed",
+        type=int,
+        default=None,
+        help=(
+            "Early stop once N real VM replays completed successfully: stop "
+            "launching new VMs, cancel in-flight replays (killing their "
+            "sandboxes) and finish the batch (default: disabled)"
         ),
     )
     parser.add_argument(
