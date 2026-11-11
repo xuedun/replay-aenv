@@ -202,25 +202,38 @@ def process_vm_timings(results_dir: Path, output_dir: Path):
         })
         vm_wall_picks.append((is_noise, wall_sec, summary_rows[-1]))
 
-    # P50 row (last line): the real (noise-excluded) VM whose wall time sits
-    # at the median of all real VMs' walls; its whole per-VM row is copied so
-    # vm_summary ends with "a typical run". Ties resolve to the lower wall.
-    real_picks = [
-        (w, row) for is_noise, w, row in vm_wall_picks
-        if not is_noise and w is not None
-    ]
-    if real_picks:
-        p50_value = _median([w for w, _row in real_picks])
-        _chosen_wall, chosen_row = min(
-            real_picks, key=lambda wr: (abs(wr[0] - p50_value), wr[0])
+    # P50 row (last line): pooled percentiles across all real
+    # (noise-excluded) VMs -- each numeric column carries the P50 of that
+    # column's per-VM values, so wall_sec is the P50 of all VM wall times
+    # and total_exec_sec the P50 of all VM exec totals (the pooled design,
+    # not a copy of a single median VM).
+    real_rows = [row for is_noise, _w, row in vm_wall_picks if not is_noise]
+    if real_rows:
+        numeric_keys = [
+            "wall_sec", "actions",
+            "avg_wait_sec", "avg_exec_sec", "avg_pause_sec", "avg_resume_sec",
+            "avg_interaction_sec",
+            "total_wait_sec", "total_exec_sec", "total_pause_sec", "total_resume_sec",
+        ]
+        p50_row = {
+            "vm": "P50",
+            "label": f"P50(pooled {len(real_rows)} real VMs)",
+            "scenario": real_rows[0]["scenario"],
+            "sandbox_id": "",
+        }
+        for key in numeric_keys:
+            vals = [
+                row[key] for row in real_rows
+                if isinstance(row.get(key), (int, float))
+            ]
+            p50_row[key] = round(_percentile(vals, 50), 4) if vals else ""
+        p50_row["succeeded"] = "{}/{}".format(
+            sum(1 for row in real_rows if row["succeeded"]), len(real_rows)
         )
-        p50_row = dict(chosen_row)
-        p50_row["vm"] = "P50"
-        p50_row["label"] = f"P50(source={chosen_row['label']})"
         summary_rows.append(p50_row)
         print(
-            f"[vm_timings] P50 row: vm={chosen_row['vm']} "
-            f"wall={chosen_row['wall_sec']}s (median of {len(real_picks)} real VMs)"
+            f"[vm_timings] P50 row: pooled across {len(real_rows)} real VMs: "
+            f"wall_p50={p50_row['wall_sec']}s exec_p50={p50_row['total_exec_sec']}s"
         )
 
     summary_path = output_dir / "vm_summary.csv"
