@@ -24,6 +24,20 @@ And logs sandbox lifecycle events (JSONL):
   removes the tree. pause_seq is a 1-based count of pauses for that sandbox
   this run, so per-pause size growth can be plotted directly.
 
+When --mpki is on (default), one `perf stat -a -C <domain> -x, -I <ms>`
+process per sysfs-detected L3 domain (AMD CCD / Kunpeng CL) is kept running
+and each sample gains per-domain fields:
+  l3_domains:          [cpulist per domain] (self-describing map key)
+  l3_mpki:             {domain_index: misses per kilo instructions}
+  l3_misses_s:         {domain_index: LLC-load-misses per second}
+  l3_instr_s:          {domain_index: instructions per second}
+Domain granularity aligns with agent/ccl_binding.py placements, so "VM
+domain vs idle domain" compares cleanly. NOTE: perf counts host-mode
+activity by default (exclude_guest) — VMM/kernel/ublk-daemon/IO paths, not
+the vCPU guest-mode execution; use l3_instr_s to sanity-check coverage.
+Degrades to a warning (fields absent) when perf or the LLC events are
+unavailable on this host.
+
 Usage: python3 spotbox_monitor.py <out_dir> [sample_interval_s]
   sample_interval_s: default 1.0. Use e.g. 0.1 for single-task runs where
   pause/resume windows are sub-second. Sandbox list polling stays at >=1s
@@ -33,11 +47,14 @@ Env: needs E2B_API_KEY / E2B_API_URL (see repo README §4).
 Stop with SIGINT/SIGTERM.
 """
 
+import argparse
 import asyncio
 import glob
 import json
+import math
 import os
 import re
+import shutil
 import signal
 import sys
 from datetime import datetime
@@ -485,6 +502,196 @@ def count_ublk():
     return len(glob.glob("/dev/ublkb*"))
 
 
+# ── L3 MPKI sampling (one perf stat process per L3 domain) ────────────────
+
+MPKI_EVENTS = ("LLC-load-misses", "LLC-loads", "instructions")
+
+
+def detect_l3_domains():
+    """Return [(domain_index, cpulist_str)] from cache/index3/shared_cpu_list.
+
+    Pure sysfs, architecture-independent: AMD CCD, Kunpeng CL and Intel CCX
+    all expose the same path. Sorted by first CPU id so the index matches
+    agent/ccl_binding.py's domain ordering.
+    """
+    domains = {}
+    base = "/sys/devices/system/cpu"
+    for entry in glob.glob(f"{base}/cpu[0-9]*"):
+        cpu_id = entry.rsplit("cpu", 1)[1]
+        if not cpu_id.isdigit():
+            continue
+        try:
+            with open(f"{entry}/cache/index3/shared_cpu_list") as f:
+                cpulist = f.read().strip()
+        except OSError:
+            continue
+        if cpulist:
+            domains.setdefault(cpulist, None)
+    ordered = sorted(domains, key=lambda cl: int(cl.split("-", 1)[0].split(",", 1)[0]))
+    return list(enumerate(ordered))
+
+
+class L3MpkiSampler:
+    """Per-L3-domain LLC miss/instruction sampling via `perf stat -I` CSV.
+
+    One long-running `perf stat -a -C <cpulist> -x, -I <ms> -e ...` process
+    per domain prints per-interval CSV lines; a reader task per process
+    keeps only the newest completed interval. Values are per-interval counts
+    (perf resets each interval), so MPKI is computed directly from the last
+    line set. Best-effort: a domain whose perf process dies (perf missing,
+    paranoid level, event unsupported) is warned once and omitted.
+    """
+
+    def __init__(self, interval_sec=1.0):
+        self._interval_sec = max(0.25, float(interval_sec))
+        self._procs = {}
+        self._tasks = {}
+        self._latest = {}   # domain_idx -> {"misses": n, "loads": n, "instr": n}
+        self._failed = set()
+        self._domains = []
+
+    async def start(self):
+        perf = shutil.which("perf")
+        if perf is None:
+            print("mpki: WARNING perf binary not found; skipping L3 MPKI metrics")
+            return False
+        self._domains = detect_l3_domains()
+        if not self._domains:
+            print("mpki: WARNING no L3 domains detected under sysfs; skipping")
+            return False
+        interval_ms = int(self._interval_sec * 1000)
+        print(
+            f"mpki: {len(self._domains)} L3 domains, "
+            f"perf interval {interval_ms}ms "
+            f"(events: {','.join(MPKI_EVENTS)})"
+        )
+        for idx, cpulist in self._domains:
+            cmd = [
+                perf, "stat", "-a", "-C", cpulist,
+                "-x", ",", "-I", str(interval_ms),
+                "-e", ",".join(MPKI_EVENTS),
+            ]
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    *cmd,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.STDOUT,
+                )
+            except (OSError, ValueError) as exc:
+                print(f"mpki: WARNING domain {idx} ({cpulist}) spawn failed: {exc}")
+                self._failed.add(idx)
+                continue
+            self._procs[idx] = (proc, cpulist)
+            self._tasks[idx] = asyncio.create_task(
+                self._read_domain(idx, proc), name=f"mpki-d{idx}"
+            )
+        await asyncio.sleep(0.05)
+        for idx, (proc, _cl) in list(self._procs.items()):
+            if proc.returncode is not None:
+                print(
+                    f"mpki: WARNING domain {idx} perf exited rc={proc.returncode} "
+                    f"(need root / LLC events unsupported?); omitting domain"
+                )
+                self._failed.add(idx)
+                self._procs.pop(idx, None)
+                self._tasks.pop(idx, None)
+        return bool(self._procs)
+
+    async def _read_domain(self, idx, proc):
+        cur = {}
+        cur_t = None
+        try:
+            while True:
+                line = await proc.stdout.readline()
+                if not line:
+                    break
+                text = line.decode("utf-8", errors="replace").strip()
+                if not text or text.startswith("#"):
+                    continue
+                parts = text.split(",")
+                if len(parts) < 3 or not parts[0].strip():
+                    continue
+                t = parts[0].strip()
+                # CSV column order: time, value, unit, event-name, run_ns, ...
+                # (verified on perf 6.6; unit is empty for count events but
+                # may be non-empty elsewhere, so scan backwards for the
+                # nearest numeric field before the event name)
+                for i in range(2, len(parts)):
+                    name = parts[i].strip()
+                    if name not in MPKI_EVENTS:
+                        continue
+                    value = None
+                    for j in range(i - 1, 0, -1):
+                        try:
+                            value = float(parts[j])
+                        except ValueError:
+                            continue
+                        break
+                    if value is None:
+                        continue  # "<not counted>" / "<not supported>"
+                    if t != cur_t:
+                        if cur_t is not None and "instr" in cur:
+                            self._latest[idx] = cur
+                        cur = {}
+                        cur_t = t
+                    key = {
+                        "LLC-load-misses": "misses",
+                        "LLC-loads": "loads",
+                        "instructions": "instr",
+                    }[name]
+                    cur[key] = value
+        except Exception as exc:  # noqa: BLE001 -- best-effort reader
+            print(f"mpki: WARNING domain {idx} reader stopped: {exc}")
+        finally:
+            if cur and "instr" in cur:
+                self._latest[idx] = cur
+
+    def sample_fields(self):
+        """Latest completed perf interval per domain → metrics fields."""
+        if not self._procs:
+            return {}
+        fields = {
+            "l3_domains": [cl for _i, cl in self._domains],
+        }
+        mpki = {}
+        misses_s = {}
+        instr_s = {}
+        for idx in self._procs:
+            snap = self._latest.get(idx)
+            if not snap:
+                continue
+            instr = snap.get("instr", 0.0)
+            misses = snap.get("misses", 0.0)
+            mpki[str(idx)] = (
+                round(misses * 1000.0 / instr, 3) if instr > 0 else None
+            )
+            misses_s[str(idx)] = round(misses / self._interval_sec, 1)
+            instr_s[str(idx)] = round(instr / self._interval_sec, 1)
+        fields["l3_mpki"] = mpki
+        fields["l3_misses_s"] = misses_s
+        fields["l3_instr_s"] = instr_s
+        return fields
+
+    async def stop(self):
+        for _idx, task in self._tasks.items():
+            task.cancel()
+        for proc, _cl in self._procs.values():
+            try:
+                proc.terminate()
+            except ProcessLookupError:
+                pass
+        for _idx, task in self._tasks.items():
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):
+                pass
+        for proc, _cl in self._procs.values():
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=2)
+            except asyncio.TimeoutError:
+                proc.kill()
+
+
 async def list_sandboxes():
     items = []
     paginator = AsyncSandbox.list()
@@ -496,7 +703,7 @@ async def list_sandboxes():
     return items
 
 
-async def main(out_dir, sample_interval=1.0, cgroup_name=None, cgroup_version="auto", cpu_range_spec=None):
+async def main(out_dir, sample_interval=1.0, cgroup_name=None, cgroup_version="auto", cpu_range_spec=None, mpki=True):
     os.makedirs(out_dir, exist_ok=True)
     metrics_path = os.path.join(out_dir, "metrics_1s.jsonl")
     events_path = os.path.join(out_dir, "sandbox_events.jsonl")
@@ -505,6 +712,12 @@ async def main(out_dir, sample_interval=1.0, cgroup_name=None, cgroup_version="a
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGINT, signal.SIGTERM):
         loop.add_signal_handler(sig, stop.set)
+
+    mpki_sampler = None
+    if mpki:
+        mpki_sampler = L3MpkiSampler(sample_interval)
+        if not await mpki_sampler.start():
+            mpki_sampler = None
 
     # Parse CPU range for per-core aggregation (e.g. "0-127" → {0,1,...,127})
     # In cgroup mode, cpu_range scopes /proc/stat reads to the cgroup's bound CPUs.
@@ -806,6 +1019,7 @@ async def main(out_dir, sample_interval=1.0, cgroup_name=None, cgroup_version="a
                         "sandboxes_paused": n_paused,
                         "disk": disk_out,
                         **cgroup_metrics,
+                        **(mpki_sampler.sample_fields() if mpki_sampler else {}),
                     }
                 )
                 + "\n"
@@ -819,13 +1033,47 @@ async def main(out_dir, sample_interval=1.0, cgroup_name=None, cgroup_version="a
 
         ef.write(json.dumps({"ts": now_ts(), "event": "monitor_stop"}) + "\n")
 
+    if mpki_sampler is not None:
+        await mpki_sampler.stop()
+
     print(f"wrote {metrics_path} and {events_path}")
 
 
+def parse_args(argv):
+    parser = argparse.ArgumentParser(
+        description="1Hz observability monitor for AgentEnv benchmark runs"
+    )
+    # Positional order matches the historical driver invocation:
+    # <out_dir> <interval> [cgroup_name [cgroup_version [cpu_range]]]
+    parser.add_argument("out_dir", help="output directory for jsonl files")
+    parser.add_argument("interval", nargs="?", type=float, default=1.0,
+                        help="sample interval seconds (default: 1.0)")
+    parser.add_argument("cgroup_name", nargs="?", default=None,
+                        help="pre-created cgroup name for per-cgroup metrics")
+    parser.add_argument("cgroup_version", nargs="?", default="auto",
+                        choices=("auto", "v1", "v2"))
+    parser.add_argument("cpu_range", nargs="?", default=None,
+                        help="cpu range for scoped host CPU reads (e.g. 0-383)")
+    parser.add_argument(
+        "--mpki", action=argparse.BooleanOptionalAction, default=True,
+        help=(
+            "Per-L3-domain LLC MPKI sampling via perf stat (default: on; "
+            "degrades to a warning when perf/LLC events are unavailable)"
+        ),
+    )
+    return parser.parse_args(argv)
+
+
 if __name__ == "__main__":
-    _cgroup_name = sys.argv[3] if len(sys.argv) > 3 else None
-    _cgroup_version = sys.argv[4] if len(sys.argv) > 4 else "auto"
-    _cpu_range_spec = sys.argv[5] if len(sys.argv) > 5 else None
-    asyncio.run(main(sys.argv[1], float(sys.argv[2]) if len(sys.argv) > 2 else 1.0,
-                     cgroup_name=_cgroup_name, cgroup_version=_cgroup_version,
-                     cpu_range_spec=_cpu_range_spec))
+    _args = parse_args(sys.argv[1:])
+    _cgroup = _args.cgroup_name or None
+    asyncio.run(
+        main(
+            _args.out_dir,
+            _args.interval,
+            cgroup_name=_cgroup,
+            cgroup_version=_args.cgroup_version,
+            cpu_range_spec=_args.cpu_range,
+            mpki=_args.mpki,
+        )
+    )
