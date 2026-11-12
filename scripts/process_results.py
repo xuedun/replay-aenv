@@ -13,7 +13,7 @@ Outputs:
   │   ├── vm_0001.csv          # per-action: wait, exec, pause, resume
   │   ├── vm_0002.csv
   │   └── ...
-  ├── vm_summary.csv           # per-VM averages + wall_sec + trailing P50 row
+  ├── vm_summary.csv           # per-VM averages + wall_sec + trailing P50/P95/P99 rows
   ├── case_summary.csv         # per-case wall/exec stats (avg/P50/P95/P99, real VMs only)
   ├── mpki_summary.csv         # global L3 MPKI stats per metrics file (when collected)
   └── observability/
@@ -202,9 +202,9 @@ def process_vm_timings(results_dir: Path, output_dir: Path):
         })
         vm_wall_picks.append((is_noise, wall_sec, summary_rows[-1]))
 
-    # P50 row (last line): pooled percentiles across all real
-    # (noise-excluded) VMs -- each numeric column carries the P50 of that
-    # column's per-VM values, so wall_sec is the P50 of all VM wall times
+    # Trailing P50/P95/P99 rows: pooled percentiles across all real
+    # (noise-excluded) VMs -- each numeric column carries that percentile of
+    # that column's per-VM values, so wall_sec is the P50 of all VM wall times
     # and total_exec_sec the P50 of all VM exec totals (the pooled design,
     # not a copy of a single median VM).
     real_rows = [row for is_noise, _w, row in vm_wall_picks if not is_noise]
@@ -215,26 +215,27 @@ def process_vm_timings(results_dir: Path, output_dir: Path):
             "avg_interaction_sec",
             "total_wait_sec", "total_exec_sec", "total_pause_sec", "total_resume_sec",
         ]
-        p50_row = {
-            "vm": "P50",
-            "label": f"P50(pooled {len(real_rows)} real VMs)",
-            "scenario": real_rows[0]["scenario"],
-            "sandbox_id": "",
-        }
-        for key in numeric_keys:
-            vals = [
-                row[key] for row in real_rows
-                if isinstance(row.get(key), (int, float))
-            ]
-            p50_row[key] = round(_percentile(vals, 50), 4) if vals else ""
-        p50_row["succeeded"] = "{}/{}".format(
-            sum(1 for row in real_rows if row["succeeded"]), len(real_rows)
-        )
-        summary_rows.append(p50_row)
-        print(
-            f"[vm_timings] P50 row: pooled across {len(real_rows)} real VMs: "
-            f"wall_p50={p50_row['wall_sec']}s exec_p50={p50_row['total_exec_sec']}s"
-        )
+        for pct in (50, 95, 99):
+            p_row = {
+                "vm": f"P{pct}",
+                "label": f"P{pct}(pooled {len(real_rows)} real VMs)",
+                "scenario": real_rows[0]["scenario"],
+                "sandbox_id": "",
+            }
+            for key in numeric_keys:
+                vals = [
+                    row[key] for row in real_rows
+                    if isinstance(row.get(key), (int, float))
+                ]
+                p_row[key] = round(_percentile(vals, pct), 4) if vals else ""
+            p_row["succeeded"] = "{}/{}".format(
+                sum(1 for row in real_rows if row["succeeded"]), len(real_rows)
+            )
+            summary_rows.append(p_row)
+            print(
+                f"[vm_timings] P{pct} row: pooled across {len(real_rows)} real VMs: "
+                f"wall_p{pct}={p_row['wall_sec']}s exec_p{pct}={p_row['total_exec_sec']}s"
+            )
 
     summary_path = output_dir / "vm_summary.csv"
     summary_fields = [
