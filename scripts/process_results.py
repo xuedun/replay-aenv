@@ -13,7 +13,7 @@ Outputs:
   │   ├── vm_0001.csv          # per-action: wait, exec, pause, resume
   │   ├── vm_0002.csv
   │   └── ...
-  ├── vm_summary.csv           # per-VM averages + wall_sec + trailing P50/P95/P99 rows
+  ├── vm_summary.csv           # per-VM averages + wall_sec + trailing avg/P50/P95/P99 rows
   ├── case_summary.csv         # per-case wall/exec stats (avg/P50/P95/P99, real VMs only)
   ├── mpki_summary.csv         # global L3 MPKI stats per metrics file (when collected)
   └── observability/
@@ -202,8 +202,8 @@ def process_vm_timings(results_dir: Path, output_dir: Path):
         })
         vm_wall_picks.append((is_noise, wall_sec, summary_rows[-1]))
 
-    # Trailing P50/P95/P99 rows: pooled percentiles across all real
-    # (noise-excluded) VMs -- each numeric column carries that percentile of
+    # Trailing avg/P50/P95/P99 rows: pooled stats across all real
+    # (noise-excluded) VMs -- each numeric column carries that statistic of
     # that column's per-VM values, so wall_sec is the P50 of all VM wall times
     # and total_exec_sec the P50 of all VM exec totals (the pooled design,
     # not a copy of a single median VM).
@@ -215,10 +215,11 @@ def process_vm_timings(results_dir: Path, output_dir: Path):
             "avg_interaction_sec",
             "total_wait_sec", "total_exec_sec", "total_pause_sec", "total_resume_sec",
         ]
-        for pct in (50, 95, 99):
+        for stat in ("avg", 50, 95, 99):
+            name = stat if isinstance(stat, str) else f"P{stat}"
             p_row = {
-                "vm": f"P{pct}",
-                "label": f"P{pct}(pooled {len(real_rows)} real VMs)",
+                "vm": name,
+                "label": f"{name}(pooled {len(real_rows)} real VMs)",
                 "scenario": real_rows[0]["scenario"],
                 "sandbox_id": "",
             }
@@ -227,14 +228,17 @@ def process_vm_timings(results_dir: Path, output_dir: Path):
                     row[key] for row in real_rows
                     if isinstance(row.get(key), (int, float))
                 ]
-                p_row[key] = round(_percentile(vals, pct), 4) if vals else ""
+                if stat == "avg":
+                    p_row[key] = round(sum(vals) / len(vals), 4) if vals else ""
+                else:
+                    p_row[key] = round(_percentile(vals, stat), 4) if vals else ""
             p_row["succeeded"] = "{}/{}".format(
                 sum(1 for row in real_rows if row["succeeded"]), len(real_rows)
             )
             summary_rows.append(p_row)
             print(
-                f"[vm_timings] P{pct} row: pooled across {len(real_rows)} real VMs: "
-                f"wall_p{pct}={p_row['wall_sec']}s exec_p{pct}={p_row['total_exec_sec']}s"
+                f"[vm_timings] {name} row: pooled across {len(real_rows)} real VMs: "
+                f"wall_{name}={p_row['wall_sec']}s exec_{name}={p_row['total_exec_sec']}s"
             )
 
     summary_path = output_dir / "vm_summary.csv"
