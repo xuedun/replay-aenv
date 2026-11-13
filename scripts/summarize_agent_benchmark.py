@@ -37,6 +37,12 @@ METRICS_GLOBS = (
     "ratio-*/repeat-*/observability/metrics_1s.jsonl",
     "*/ratio-*/repeat-*/observability/metrics_1s.jsonl",
 )
+VM_METRICS_GLOBS = (
+    "tasks/*/sandbox-metrics.json",
+    "ratio-*/repeat-*/tasks/*/sandbox-metrics.json",
+    "*/ratio-*/repeat-*/tasks/*/sandbox-metrics.json",
+)
+GB = 1024.0 ** 3
 
 
 def percentile(values: list[float], q: float) -> float | None:
@@ -176,41 +182,142 @@ def metrics_plot(records: list[dict], label: str, out_path: Path, n_vms: int) ->
     return True
 
 
-def process_root(root: Path, out_dir: Path) -> None:
+def load_vm_mem(path: Path) -> dict | None:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        print(f"  WARN: unreadable {path}: {exc}", file=sys.stderr)
+        return None
+    samples = data.get("samples") or []
+    pts = [(s["timestampUnix"], s["memUsed"], s["memCache"])
+           for s in samples
+           if isinstance(s.get("timestampUnix"), (int, float))
+           and isinstance(s.get("memUsed"), (int, float))
+           and isinstance(s.get("memCache"), (int, float))]
+    if not pts:
+        return None
+    return {
+        "task": path.parent.name,
+        "sandbox_id": data.get("sandbox_id") or "",
+        "points": pts,
+    }
+
+
+def vm_mem_section(vm_mems: list[dict], out_dir: Path, per_vm: bool = False) -> None:
+    rows = []
+    for vm in vm_mems:
+        used = [p[1] / GB for p in vm["points"]]
+        cache = [p[2] / GB for p in vm["points"]]
+        rows.append({
+            "trial": vm.get("trial", ""),
+            "task": vm["task"],
+            "sandbox_id": vm["sandbox_id"],
+            "samples": len(vm["points"]),
+            "mem_used_avg_gb": round(sum(used) / len(used), 3),
+            "mem_used_peak_gb": round(max(used), 3),
+            "mem_cache_avg_gb": round(sum(cache) / len(cache), 3),
+            "mem_cache_peak_gb": round(max(cache), 3),
+        })
+    csv_path = out_dir / "vm_mem_summary.csv"
+    with open(csv_path, "w", newline="", encoding="utf-8-sig") as f:
+        writer = csv.DictWriter(f, fieldnames=[
+            "trial", "task", "sandbox_id", "samples",
+            "mem_used_avg_gb", "mem_used_peak_gb", "mem_cache_avg_gb", "mem_cache_peak_gb"])
+        writer.writeheader()
+        writer.writerows(rows)
+    print(f"  vm mem: {len(vm_mems)} VMs, wrote: {csv_path}")
+
+    t0 = min(p[0] for vm in vm_mems for p in vm["points"])
+    fig, (ax_used, ax_cache) = plt.subplots(2, 1, figsize=(14, 8), sharex=True)
+    for vm in vm_mems:
+        xs = [p[0] - t0 for p in vm["points"]]
+        ax_used.plot(xs, [p[1] / GB for p in vm["points"]], linewidth=0.9, alpha=0.65)
+        ax_cache.plot(xs, [p[2] / GB for p in vm["points"]], linewidth=0.9, alpha=0.65)
+    ax_used.set_ylabel("VM memUsed (GB)")
+    ax_used.set_title(f"Per-VM guest memory over time ({len(vm_mems)} VMs, server-sampled)")
+    ax_used.grid(alpha=0.3)
+    ax_cache.set_ylabel("VM memCache (GB)")
+    ax_cache.set_xlabel("elapsed since first sample (s)")
+    ax_cache.grid(alpha=0.3)
+    fig.tight_layout()
+    png_path = out_dir / "vm_mem_curves.png"
+    fig.savefig(png_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  wrote: {png_path}")
+
+    if per_vm:
+        plots_dir = out_dir / "vm_mem_plots"
+        plots_dir.mkdir(parents=True, exist_ok=True)
+        for vm in vm_mems:
+            xs = [p[0] - vm["points"][0][0] for p in vm["points"]]
+            fig, (ax_used, ax_cache) = plt.subplots(2, 1, figsize=(10, 6), sharex=True)
+            ax_used.plot(xs, [p[1] / GB for p in vm["points"]], linewidth=1.2)
+            ax_used.set_ylabel("memUsed (GB)")
+            ax_used.set_title(
+                f"VM {vm['task']} sandbox={vm['sandbox_id'] or 'n/a'}"
+                + (f" trial={vm.get('trial', '')}" if vm.get("trial", ".") != "." else ""))
+            ax_used.grid(alpha=0.3)
+            ax_cache.plot(xs, [p[2] / GB for p in vm["points"]], linewidth=1.2, color="tab:orange")
+            ax_cache.set_ylabel("memCache (GB)")
+            ax_cache.set_xlabel("elapsed since VM first sample (s)")
+            ax_cache.grid(alpha=0.3)
+            fig.tight_layout()
+            trial = vm.get("trial", ".")
+            prefix = trial.replace("/", "_") + "_" if trial not in (".", "") else ""
+            fig.savefig(plots_dir / f"vm_mem_{prefix}{vm['task']}.png", dpi=130, bbox_inches="tight")
+            plt.close(fig)
+        print(f"  wrote {len(vm_mems)} per-VM PNGs: {plots_dir}/")
+
+
+def process_root(root: Path, out_dir: Path, per_vm: bool = False) -> None:
     task_files = discover(root, TASK_GLOBS)
     vms = [vm for f in task_files if (vm := load_vm(f)) is not None]
-    if not vms:
-        print(f"[{root}] no task results found, skipping")
-        return
-    print(f"[{root}] {len(vms)} VM task results")
     out_dir.mkdir(parents=True, exist_ok=True)
-    exec_summary(vms, out_dir)
+    if vms:
+        print(f"[{root}] {len(vms)} VM task results")
+        exec_summary(vms, out_dir)
+    else:
+        print(f"[{root}] no task results; plotting metrics curves only")
 
     metrics_files = discover(root, METRICS_GLOBS)
     if not metrics_files:
         print("  no metrics_1s.jsonl found, skipping plots")
-        return
-    plotted = 0
-    for mf in metrics_files:
-        try:
-            records = [json.loads(line) for line in mf.read_text(encoding="utf-8").splitlines() if line.strip()]
-        except (OSError, json.JSONDecodeError) as exc:
-            print(f"  WARN: unreadable {mf}: {exc}", file=sys.stderr)
-            continue
-        label = task_label(mf, root)
-        safe = label.replace("/", "_") if label not in (".", "") else "run"
-        png = out_dir / f"metrics_{safe}.png"
-        if metrics_plot(records, label, png, len(vms)):
-            plotted += 1
-            print(f"  wrote: {png} ({len(records)} samples)")
-    if plotted == 0:
-        print("  WARN: no metrics plots produced")
+    else:
+        plotted = 0
+        for mf in metrics_files:
+            try:
+                records = [json.loads(line) for line in mf.read_text(encoding="utf-8").splitlines() if line.strip()]
+            except (OSError, json.JSONDecodeError) as exc:
+                print(f"  WARN: unreadable {mf}: {exc}", file=sys.stderr)
+                continue
+            label = task_label(mf, root)
+            safe = label.replace("/", "_") if label not in (".", "") else "run"
+            png = out_dir / f"metrics_{safe}.png"
+            if metrics_plot(records, label, png, len(vms)):
+                plotted += 1
+                print(f"  wrote: {png} ({len(records)} samples)")
+        if plotted == 0:
+            print("  WARN: no metrics plots produced")
+
+    vm_mem_files = discover(root, VM_METRICS_GLOBS)
+    vm_mems = []
+    for f in vm_mem_files:
+        vm = load_vm_mem(f)
+        if vm is not None:
+            vm["trial"] = task_label(f, root)
+            vm_mems.append(vm)
+    if vm_mems:
+        vm_mem_section(vm_mems, out_dir, per_vm=per_vm)
+    else:
+        print("  no per-VM sandbox-metrics.json found, skipping vm mem curves")
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("roots", nargs="+", type=Path, help="run output dir or bench experiment root")
     parser.add_argument("--out", type=Path, default=None, help="output dir (default: <root>/processed)")
+    parser.add_argument("--per-vm", action="store_true",
+                        help="also write one PNG per VM under <out>/vm_mem_plots/")
     args = parser.parse_args()
     for root in args.roots:
         root = root.expanduser().resolve()
@@ -218,7 +325,7 @@ def main() -> int:
             print(f"ERROR: {root} is not a directory", file=sys.stderr)
             return 1
         out_dir = (args.out or root / "processed").expanduser().resolve()
-        process_root(root, out_dir)
+        process_root(root, out_dir, per_vm=args.per_vm)
     return 0
 
 

@@ -57,6 +57,39 @@ cmd_backup() {
     done
 }
 
+policy_nominal() {
+    p=$1
+    if [ -f "$p/nominal_freq" ]; then
+        cat "$p/nominal_freq"
+        return
+    fi
+    if [ -f /sys/devices/system/cpu/amd_pstate/nominal_freq ]; then
+        cat /sys/devices/system/cpu/amd_pstate/nominal_freq
+        return
+    fi
+    first_cpu=$(set -- $(cat "$p/related_cpus" 2>/dev/null); echo "${1:-}")
+    if [ -n "$first_cpu" ] && [ -f "/sys/devices/system/cpu/cpu$first_cpu/acpi_cppc/nominal_perf" ]; then
+        cat "/sys/devices/system/cpu/cpu$first_cpu/acpi_cppc/nominal_perf"
+        return
+    fi
+    echo ""
+}
+
+normalize_khz() {
+    v=${1:-}
+    if [ -z "$v" ]; then echo ""; return; fi
+    case $v in
+        *[!0-9]*) echo ""; return ;;
+    esac
+    if [ "$v" -lt 1000 ]; then
+        echo ""
+    elif [ "$v" -lt 100000 ]; then
+        echo $((v * 1000))
+    else
+        echo "$v"
+    fi
+}
+
 cmd_limit() {
     freq=${1:-$DEFAULT_FREQ}
     case $freq in
@@ -70,17 +103,31 @@ cmd_limit() {
         die "no cpufreq policies found (cpufreq disabled?)"
     fi
     cmd_backup
+    mismatch=0
     for p in $(policies); do
         min=$(cat "$p/scaling_min_freq")
         if [ "$min" -gt "$freq" ]; then
             echo "$freq" > "$p/scaling_min_freq"
         fi
         echo "$freq" > "$p/scaling_max_freq"
-        if [ -f "$p/boost" ]; then echo 0 > "$p/boost"; fi
-        if [ -f "$p/cpb" ]; then echo 0 > "$p/cpb"; fi
+        nominal=$(normalize_khz "$(policy_nominal "$p")")
+        if [ -n "$nominal" ] && [ "$freq" -le "$nominal" ]; then
+            if [ -f "$p/boost" ]; then echo 0 > "$p/boost" 2>/dev/null || true; fi
+            if [ -f "$p/cpb" ]; then echo 0 > "$p/cpb" 2>/dev/null || true; fi
+        fi
+        eff=$(cat "$p/scaling_max_freq")
+        if [ "$eff" != "$freq" ]; then
+            mismatch=$((mismatch + 1))
+            if [ "$mismatch" -le 3 ]; then
+                echo "  WARN policy ${p##*/}: effective max=${eff} kHz (requested ${freq}; nominal=${nominal:-unknown})" >&2
+            fi
+        fi
     done
     echo "$freq" > "$MARKER"
-    echo "clamped $n_policies policies to ${freq} kHz (governor untouched; backup: $BACKUP_DIR)"
+    echo "clamped $n_policies policies to ${freq} kHz (governor untouched; boost left on when freq > nominal; backup: $BACKUP_DIR)"
+    if [ "$mismatch" -gt 0 ]; then
+        echo "NOTE: $mismatch policy(ies) did not land exactly on ${freq} kHz (driver snapped to an available P-state)."
+    fi
 }
 
 cmd_restore() {
@@ -103,8 +150,8 @@ cmd_restore() {
         if [ -n "$max" ]; then echo "$max" > "$p/scaling_max_freq"; fi
         if [ -n "$min" ]; then echo "$min" > "$p/scaling_min_freq"; fi
         if [ -n "$gov" ]; then echo "$gov" > "$p/scaling_governor"; fi
-        if [ -n "$boost" ] && [ -f "$p/boost" ]; then echo "$boost" > "$p/boost"; fi
-        if [ -n "$cpb" ] && [ -f "$p/cpb" ]; then echo "$cpb" > "$p/cpb"; fi
+        if [ -n "$boost" ] && [ -f "$p/boost" ]; then echo "$boost" > "$p/boost" 2>/dev/null || true; fi
+        if [ -n "$cpb" ] && [ -f "$p/cpb" ]; then echo "$cpb" > "$p/cpb" 2>/dev/null || true; fi
         if [ -n "$epp" ] && [ -f "$p/energy_performance_preference" ]; then
             echo "$epp" > "$p/energy_performance_preference" 2>/dev/null || true
         fi
