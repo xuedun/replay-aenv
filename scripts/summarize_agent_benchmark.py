@@ -94,12 +94,27 @@ def load_vm(path: Path) -> dict | None:
         return None
     steps = data.get("steps") or []
     return {
+        "task": path.parent.name,
+        "sandbox_id": data.get("sandbox_id") or "",
         "exec_sec": round(sum(s.get("command_sec") or 0.0 for s in steps), 4),
+        "delay_sec": round(sum(s.get("delay_wait_sec") or 0.0 for s in steps), 4),
         "wall_sec": data.get("elapsed_sec"),
         "steps": len(steps),
         "succeeded": bool(data.get("succeeded")),
         "trajectory": Path(str(data.get("trajectory_path") or "unknown")).name,
     }
+
+
+def vm_total_csv(vms: list[dict], out_dir: Path) -> None:
+    path = out_dir / "vm_total.csv"
+    fields = ["trial", "task", "sandbox_id", "trajectory", "steps",
+              "delay_sec", "exec_sec", "wall_sec", "succeeded"]
+    with open(path, "w", newline="", encoding="utf-8-sig") as f:
+        writer = csv.DictWriter(f, fieldnames=fields, extrasaction="ignore")
+        writer.writeheader()
+        for vm in vms:
+            writer.writerow({k: vm.get(k, "") for k in fields})
+    print(f"  wrote: {path} ({len(vms)} VMs)")
 
 
 def exec_summary(vms: list[dict], out_dir: Path) -> None:
@@ -271,11 +286,17 @@ def vm_mem_section(vm_mems: list[dict], out_dir: Path, per_vm: bool = False) -> 
 
 def process_root(root: Path, out_dir: Path, per_vm: bool = False) -> None:
     task_files = discover(root, TASK_GLOBS)
-    vms = [vm for f in task_files if (vm := load_vm(f)) is not None]
+    vms = []
+    for f in task_files:
+        vm = load_vm(f)
+        if vm is not None:
+            vm["trial"] = task_label(f, root)
+            vms.append(vm)
     out_dir.mkdir(parents=True, exist_ok=True)
     if vms:
         print(f"[{root}] {len(vms)} VM task results")
         exec_summary(vms, out_dir)
+        vm_total_csv(vms, out_dir)
     else:
         print(f"[{root}] no task results; plotting metrics curves only")
 
